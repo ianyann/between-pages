@@ -12,6 +12,7 @@ import Library from './pages/Library'
 import WorkView from './pages/WorkView'
 import WorkEditor from './pages/WorkEditor'
 import Diagnostics from './pages/Diagnostics'
+import Backup from './pages/Backup'
 
 requestPersistentStorage()
 
@@ -96,6 +97,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="work/:id" element={<WorkView />} />
           <Route path="work/:id/edit" element={<WorkEditor />} />
           <Route path="diagnostics" element={<Diagnostics />} />
+          <Route path="backup" element={<Backup />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

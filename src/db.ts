@@ -91,17 +91,14 @@ db.version(2)
     assets: 'id, entryId',
     works: 'id, type, name, updatedAt, coverAssetId',
   })
-  .upgrade((tx: Transaction) =>
-    // 只补全缺失字段，不改 ID、不动其他内容
-    tx
-      .table('entries')
-      .toCollection()
-      .modify((e: Partial<Entry>) => {
-        if (!Array.isArray(e.workIds)) e.workIds = []
-        if (!Array.isArray(e.imageIds)) e.imageIds = []
-        if (e.canvas === undefined) e.canvas = null
-      }),
-  )
+  .upgrade((tx: Transaction) => tx.table('entries').toCollection().modify(fillEntryDefaults))
+
+/** 为旧版本日记补全缺失字段（数据库迁移与导入备份共用）。只补缺失项，不改 ID、不动其他内容。 */
+export function fillEntryDefaults(e: Partial<Entry>) {
+  if (!Array.isArray(e.workIds)) e.workIds = []
+  if (!Array.isArray(e.imageIds)) e.imageIds = []
+  if (e.canvas === undefined) e.canvas = null
+}
 
 /** 请求持久化存储，降低浏览器在空间紧张时清除数据的概率。 */
 export function requestPersistentStorage() {

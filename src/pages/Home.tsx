@@ -1,12 +1,16 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { Link } from 'react-router-dom'
+import { getLastBackup } from '../backup'
 import { listEntries } from '../db'
 import { EntryCard } from './EntryList'
 
 const RECENT_COUNT = 5
+const BACKUP_REMINDER_DAYS = 7
 
 export default function Home() {
   const recent = useLiveQuery(() => listEntries(RECENT_COUNT))
+  const lastBackup = getLastBackup()
+  const needsBackup = !!recent?.length && (!lastBackup || Date.now() - lastBackup > BACKUP_REMINDER_DAYS * 86400_000)
 
   return (
     <div>
@@ -30,6 +34,13 @@ export default function Home() {
         </div>
       </header>
 
+      {needsBackup && (
+        <Link to="/backup" className="mb-10 flex items-center justify-between border border-ink px-4 py-3 text-sm">
+          <span>{lastBackup ? `已超过 ${BACKUP_REMINDER_DAYS} 天没有备份` : '还没有备份过，数据只存在这台设备上'}</span>
+          <span className="shrink-0 pl-3">去备份 →</span>
+        </Link>
+      )}
+
       <section>
         <div className="mb-2 flex items-baseline justify-between border-b border-ink pb-3">
           <h2 className="font-serif text-lg">最近</h2>
@@ -47,7 +58,10 @@ export default function Home() {
       </section>
 
       <footer className="mt-16 pb-8 text-center">
-        <Link to="/diagnostics" className="text-xs text-mute">数据诊断</Link>
+        <div className="flex justify-center gap-6 text-xs text-mute">
+          <Link to="/backup">备份与恢复</Link>
+          <Link to="/diagnostics">数据诊断</Link>
+        </div>
       </footer>
     </div>
   )
