@@ -30,7 +30,10 @@ export default function EntryView() {
     <article className="pb-16">
       <div className="mb-10 flex items-center justify-between text-sm">
         <Link to="/entries" className="text-mute">← 全部记录</Link>
-        <Link to={`/entry/${id}/edit`} className="rounded-full border border-ink px-4 py-1.5">编辑</Link>
+        <div className="flex gap-2">
+          <Link to={`/entry/${id}/studio`} className="rounded-full border border-ink px-4 py-1.5">创作桌</Link>
+          <Link to={`/entry/${id}/edit`} className="rounded-full border border-ink px-4 py-1.5">编辑</Link>
+        </div>
       </div>
 
       <div className="mb-4 flex items-center gap-3 text-xs tracking-wider text-mute">

@@ -1,4 +1,4 @@
-import { Component, StrictMode, useEffect, useState, type ReactNode } from 'react'
+import { Component, StrictMode, Suspense, lazy, useEffect, useState, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { HashRouter, Link, Navigate, Outlet, Route, Routes, useLocation } from 'react-router-dom'
 import './index.css'
@@ -13,11 +13,23 @@ import WorkView from './pages/WorkView'
 import WorkEditor from './pages/WorkEditor'
 import Diagnostics from './pages/Diagnostics'
 import Backup from './pages/Backup'
+// 创作桌依赖体积较大的画布库，按需加载，不拖慢其他页面
+const Studio = lazy(() => import('./studio/Studio'))
 
 requestPersistentStorage()
 
 function Layout() {
   const { pathname } = useLocation()
+  // 创作桌占满整个屏幕，不使用页面的窄栏布局
+  if (pathname.endsWith('/studio'))
+    return (
+      <>
+        <DbStatus />
+        <ErrorBoundary key={pathname}>
+          <Outlet />
+        </ErrorBoundary>
+      </>
+    )
   return (
     <div className="mx-auto min-h-dvh max-w-2xl px-5 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
       {pathname !== '/' && !pathname.endsWith('/edit') && pathname !== '/library/new' && (
@@ -92,6 +104,14 @@ createRoot(document.getElementById('root')!).render(
           <Route path="new" element={<NewEntry />} />
           <Route path="entry/:id" element={<EntryView />} />
           <Route path="entry/:id/edit" element={<EntryEditor />} />
+          <Route
+            path="entry/:id/studio"
+            element={
+              <Suspense fallback={<p className="py-20 text-center text-sm text-mute">正在打开创作桌…</p>}>
+                <Studio />
+              </Suspense>
+            }
+          />
           <Route path="library" element={<Library />} />
           <Route path="library/new" element={<WorkEditor />} />
           <Route path="work/:id" element={<WorkView />} />

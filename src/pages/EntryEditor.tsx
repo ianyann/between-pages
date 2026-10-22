@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { db, saveEntry, type Asset, type CanvasData, type EntryStatus } from '../db'
+import { db, saveEntry, type Asset, type EntryStatus } from '../db'
 import { assetToUrl, fileToAsset, formatClock, today } from '../lib'
 import WorkPicker from '../WorkPicker'
 
@@ -35,7 +35,7 @@ export default function EntryEditor() {
   const draftRef = useRef(draft)
   const urlsRef = useRef(urls)
   urlsRef.current = urls
-  const meta = useRef<{ createdAt: number | null; canvas: CanvasData | null }>({ createdAt: null, canvas: null })
+  const meta = useRef<{ createdAt: number | null; canvas: unknown }>({ createdAt: null, canvas: null })
   const pendingAssets = useRef(new Map<string, Asset>()) // 新添加、尚未写入数据库的图片
   const removedIds = useRef(new Set<string>()) // 已从日记移除、待从数据库删除的图片
   const version = useRef(0)

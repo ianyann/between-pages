@@ -8,8 +8,9 @@ import Dexie, { type EntityTable, type Transaction } from 'dexie'
  * 版本历史：
  * v1 第一阶段：entries、assets
  * v2 第二阶段：新增 works；entries 增加 *workIds、*imageIds 多值索引
+ * v3 第三阶段：新增 canvases（创作桌画布）；旧的 Entry.canvas 字段迁入该表
  */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export type EntryStatus = 'draft' | 'done'
 
@@ -24,17 +25,65 @@ export interface Entry {
   imageIds: string[] // 图片顺序，指向 assets 表
   workIds: string[] // 关联的作品，指向 works 表（只存 ID）
 
-  // —— 预留扩展字段 ——
-  canvas: CanvasData | null // 自由拼贴画布
+  /** 已弃用：v3 起画布保存在 canvases 表。保留此字段（恒为 null）只为兼容旧数据与旧备份。 */
+  canvas: unknown | null
 }
 
-/** 预留：画布内容。后续阶段再细化元素类型。 */
-export interface CanvasData {
-  version: number
+/** 画布逻辑尺寸。元素坐标始终使用这套尺寸，与屏幕显示大小无关。 */
+export const CANVAS_WIDTH = 900
+export const CANVAS_HEIGHT = 1200
+export const CANVAS_FORMAT = 1
+
+/** 一篇日记的创作桌画布。 */
+export interface CanvasDoc {
+  id: string
+  entryId: string // 所属日记
+  format: number // 画布数据格式版本（CANVAS_FORMAT）
   width: number
   height: number
-  elements: unknown[]
+  background: string
+  elements: CanvasElement[] // 按 z 从下到上排列
+  assetIds: string[] // 画布用到的图片，由 elements 派生，用于引用检查
+  createdAt: number
+  updatedAt: number
 }
+
+interface BaseElement {
+  id: string // 画布内唯一；同一素材多次放入也各自独立
+  x: number // 左上角（旋转前），逻辑坐标
+  y: number
+  width: number
+  height: number
+  rotation: number // 角度，绕左上角
+  z: number // 图层顺序，0 在最下
+}
+
+export interface ImageElement extends BaseElement {
+  type: 'image'
+  assetId: string // 指向 assets 表，不复制图片数据
+  style: { opacity: number }
+}
+
+export type TextPreset = 'title' | 'body' | 'note'
+
+export interface TextStyle {
+  preset: TextPreset // 初始样式来源，仅作记录
+  fontFamily: 'serif' | 'sans'
+  fontSize: number
+  fontWeight: 'normal' | 'bold'
+  color: string
+  align: 'left' | 'center' | 'right'
+  lineHeight: number
+  letterSpacing: number
+}
+
+export interface TextElement extends BaseElement {
+  type: 'text'
+  text: string // 画布上的文字，独立于日记正文
+  style: TextStyle
+}
+
+export type CanvasElement = ImageElement | TextElement
 
 export type WorkType = 'manga' | 'novel' | 'film' | 'tv' | 'other'
 
@@ -78,6 +127,7 @@ export const db = new Dexie('between-pages') as Dexie & {
   entries: EntityTable<Entry, 'id'>
   assets: EntityTable<Asset, 'id'>
   works: EntityTable<Work, 'id'>
+  canvases: EntityTable<CanvasDoc, 'id'>
 }
 
 db.version(1).stores({
@@ -92,6 +142,27 @@ db.version(2)
     works: 'id, type, name, updatedAt, coverAssetId',
   })
   .upgrade((tx: Transaction) => tx.table('entries').toCollection().modify(fillEntryDefaults))
+
+db.version(3)
+  .stores({
+    entries: 'id, entryDate, updatedAt, status, *workIds, *imageIds',
+    assets: 'id, entryId',
+    works: 'id, type, name, updatedAt, coverAssetId',
+    canvases: 'id, entryId, updatedAt, *assetIds',
+  })
+  .upgrade(async (tx: Transaction) => {
+    // 第一、二阶段从未写入 Entry.canvas；若存在符合结构的旧画布，迁入新表并把原字段置 null，其余一律不动
+    const entries: Entry[] = await tx.table('entries').toArray()
+    const now = Date.now()
+    for (const e of entries) {
+      const old = e.canvas as Partial<CanvasDoc> | null | undefined
+      if (old === null) continue
+      if (old && Array.isArray(old.elements)) {
+        await tx.table('canvases').put(normalizeCanvas({ ...old, id: newCanvasId(e.id), entryId: e.id, createdAt: now, updatedAt: now }))
+      }
+      await tx.table('entries').update(e.id, { canvas: null })
+    }
+  })
 
 /** 为旧版本日记补全缺失字段（数据库迁移与导入备份共用）。只补缺失项，不改 ID、不动其他内容。 */
 export function fillEntryDefaults(e: Partial<Entry>) {
@@ -117,39 +188,92 @@ export async function listEntries(limit?: number): Promise<Entry[]> {
   return limit ? all.slice(0, limit) : all
 }
 
+/** 涉及素材增删的事务都需要这些表，以便检查全部引用。 */
+const ASSET_TABLES = () => [db.entries, db.assets, db.works, db.canvases]
+
 /**
- * 删除不再被任何日记或作品引用的素材。必须在包含 entries、works、assets 的读写事务中调用，
+ * 删除不再被任何日记、作品或画布引用的素材。必须在包含 entries、works、assets 的读写事务中调用，
  * 且调用前先写入引用变化。
  */
 async function deleteUnreferencedAssets(ids: Iterable<string>) {
   for (const id of new Set(ids)) {
     const usedByEntry = await db.entries.where('imageIds').equals(id).count()
     const usedByWork = await db.works.where('coverAssetId').equals(id).count()
-    if (!usedByEntry && !usedByWork) await db.assets.delete(id)
+    const usedByCanvas = await db.canvases.where('assetIds').equals(id).count()
+    if (!usedByEntry && !usedByWork && !usedByCanvas) await db.assets.delete(id)
   }
 }
 
 /** 在一个事务内保存日记与图片变更：要么全部成功，要么全部不生效。 */
 export async function saveEntry(entry: Entry, newAssets: Asset[], removedAssetIds: string[]) {
-  await db.transaction('rw', [db.entries, db.assets, db.works], async () => {
+  await db.transaction('rw', ASSET_TABLES(), async () => {
     if (newAssets.length) await db.assets.bulkPut(newAssets)
     await db.entries.put(entry)
     await deleteUnreferencedAssets(removedAssetIds)
   })
 }
 
+/** 删除日记及其画布；图片只在不再被引用时删除。 */
 export async function deleteEntry(id: string) {
-  await db.transaction('rw', [db.entries, db.assets, db.works], async () => {
+  await db.transaction('rw', ASSET_TABLES(), async () => {
     const entry = await db.entries.get(id)
     const ownKeys = await db.assets.where('entryId').equals(id).primaryKeys()
+    const canvases = await db.canvases.where('entryId').equals(id).toArray()
+    await db.canvases.bulkDelete(canvases.map((c) => c.id))
     await db.entries.delete(id)
-    await deleteUnreferencedAssets([...(entry?.imageIds ?? []), ...ownKeys])
+    await deleteUnreferencedAssets([...(entry?.imageIds ?? []), ...ownKeys, ...canvases.flatMap((c) => c.assetIds)])
   })
+}
+
+/** 读取日记的画布；没有则返回 undefined。 */
+export async function loadCanvas(entryId: string): Promise<CanvasDoc | undefined> {
+  const doc = await db.canvases.where('entryId').equals(entryId).first()
+  return doc && normalizeCanvas(doc)
+}
+
+/** 保存画布及新上传的图片（同一事务）。 */
+export async function saveCanvas(doc: CanvasDoc, newAssets: Asset[]) {
+  await db.transaction('rw', [db.canvases, db.assets], async () => {
+    if (newAssets.length) await db.assets.bulkPut(newAssets)
+    await db.canvases.put(normalizeCanvas(doc))
+  })
+}
+
+/**
+ * 清理只为这篇日记上传、却已不被任何地方引用的图片（例如从画布上删掉的本地图片）。
+ * 只在打开创作桌时调用：此时没有撤销历史，不会删掉之后还可能被撤销找回的图片。
+ */
+export async function cleanupEntryAssets(entryId: string) {
+  await db.transaction('rw', ASSET_TABLES(), async () => {
+    await deleteUnreferencedAssets(await db.assets.where('entryId').equals(entryId).primaryKeys())
+  })
+}
+
+export const newCanvasId = (entryId: string) => `canvas-${entryId}`
+
+/** 补全缺失字段、按 z 排序并重新编号、派生 assetIds。读写与导入共用。 */
+export function normalizeCanvas(doc: Partial<CanvasDoc> & { id: string; entryId: string }): CanvasDoc {
+  const elements = (Array.isArray(doc.elements) ? doc.elements : [])
+    .filter((el) => el && typeof el.id === 'string' && (el.type === 'image' || el.type === 'text'))
+    .sort((a, b) => (a.z ?? 0) - (b.z ?? 0))
+    .map((el, i) => ({ ...el, rotation: el.rotation ?? 0, z: i }))
+  return {
+    id: doc.id,
+    entryId: doc.entryId,
+    format: doc.format ?? CANVAS_FORMAT,
+    width: doc.width ?? CANVAS_WIDTH,
+    height: doc.height ?? CANVAS_HEIGHT,
+    background: doc.background ?? '#F7F6F2',
+    elements,
+    assetIds: [...new Set(elements.flatMap((el) => (el.type === 'image' ? [el.assetId] : [])))],
+    createdAt: doc.createdAt ?? Date.now(),
+    updatedAt: doc.updatedAt ?? Date.now(),
+  }
 }
 
 /** 保存作品；更换或移除封面时，旧封面仅在无其他引用时删除。 */
 export async function saveWork(work: Work, newCover: Asset | null) {
-  await db.transaction('rw', [db.entries, db.assets, db.works], async () => {
+  await db.transaction('rw', ASSET_TABLES(), async () => {
     const prev = await db.works.get(work.id)
     if (newCover) await db.assets.put(newCover)
     await db.works.put(work)
@@ -161,7 +285,7 @@ export async function saveWork(work: Work, newCover: Asset | null) {
 
 /** 删除作品：只从日记中解除关联，不删除日记本身。 */
 export async function deleteWork(id: string) {
-  await db.transaction('rw', [db.entries, db.assets, db.works], async () => {
+  await db.transaction('rw', ASSET_TABLES(), async () => {
     const work = await db.works.get(id)
     await db.entries
       .where('workIds')

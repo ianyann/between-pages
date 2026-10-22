@@ -36,8 +36,9 @@ const KEEP_ORIGINAL_BYTES = 1.5 * 1024 * 1024
 
 /**
  * 读取用户选择的图片并转成可存库的素材。
- * 大图会缩放到长边 2400px 并转为 JPEG，避免手机照片撑满存储；
- * GIF 与解码失败的格式保留原文件。
+ * 大图会缩放到长边 2400px，避免手机照片撑满存储：
+ * 不含透明像素的转为 JPEG；含透明像素的保持 PNG，保留透明背景。
+ * 含透明像素且无需缩放的图片、GIF 与解码失败的格式保留原文件。
  */
 export async function fileToAsset(file: File, owner: { entryId?: string; workId?: string }): Promise<Asset> {
   let blob: Blob = file
@@ -53,11 +54,13 @@ export async function fileToAsset(file: File, owner: { entryId?: string; workId?
       const canvas = document.createElement('canvas')
       canvas.width = Math.round(width * scale)
       canvas.height = Math.round(height * scale)
-      const ctx = canvas.getContext('2d')!
-      ctx.fillStyle = '#fff' // PNG 透明区域转 JPEG 时填白
-      ctx.fillRect(0, 0, canvas.width, canvas.height)
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })!
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
-      const out = await new Promise<Blob | null>((r) => canvas.toBlob(r, 'image/jpeg', 0.88))
+      const transparent = file.type !== 'image/jpeg' && hasTransparency(ctx, canvas.width, canvas.height)
+      if (transparent && scale === 1) throw new Error('keep original') // 透明图且尺寸合适：保留原文件
+      const out = await new Promise<Blob | null>((r) =>
+        transparent ? canvas.toBlob(r, 'image/png') : canvas.toBlob(r, 'image/jpeg', 0.88),
+      )
       if (out) {
         blob = out
         width = canvas.width
@@ -65,7 +68,7 @@ export async function fileToAsset(file: File, owner: { entryId?: string; workId?
       }
     }
   } catch {
-    // 无法解码（如部分浏览器上的 HEIC）：保留原文件
+    // 无法解码（如部分浏览器上的 HEIC）或需保留原文件
   }
 
   return {
@@ -79,6 +82,12 @@ export async function fileToAsset(file: File, owner: { entryId?: string; workId?
     size: blob.size,
     createdAt: Date.now(),
   }
+}
+
+function hasTransparency(ctx: CanvasRenderingContext2D, w: number, h: number): boolean {
+  const data = ctx.getImageData(0, 0, w, h).data
+  for (let i = 3; i < data.length; i += 4) if (data[i] < 255) return true
+  return false
 }
 
 function loadImage(file: Blob): Promise<HTMLImageElement> {

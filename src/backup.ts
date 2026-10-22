@@ -1,8 +1,9 @@
-import { db, DB_VERSION, fillEntryDefaults, WORK_TYPES, type Asset, type Entry, type Work } from './db'
+import { db, DB_VERSION, fillEntryDefaults, normalizeCanvas, WORK_TYPES, type Asset, type CanvasDoc, type Entry, type Work } from './db'
 
 /**
  * 备份文件格式（JSON）：
- * { app, format, dbVersion, exportedAt, entries, works, assets }
+ * { app, format, dbVersion, exportedAt, entries, works, canvases, assets }
+ * works（v2 起）与 canvases（v3 起）为可选，旧备份没有这两项也能导入。
  * assets[].data 为 base64 编码的图片二进制。
  * format 只在文件结构本身变化时递增；dbVersion 记录导出时的数据库版本，导入时据此补全旧字段。
  */
@@ -14,13 +15,14 @@ type BackupAsset = Omit<Asset, 'data'> & { data: string }
 export interface BackupSummary {
   entries: number
   works: number
+  canvases: number
   assets: number
 }
 
 /** 生成备份文件。逐段拼接成 Blob，避免把全部图片拼成一个超长字符串。 */
 export async function exportBackup(): Promise<{ file: File; summary: BackupSummary }> {
-  const [entries, works, assets] = await db.transaction('r', [db.entries, db.works, db.assets], () =>
-    Promise.all([db.entries.toArray(), db.works.toArray(), db.assets.toArray()]),
+  const [entries, works, canvases, assets] = await db.transaction('r', [db.entries, db.works, db.canvases, db.assets], () =>
+    Promise.all([db.entries.toArray(), db.works.toArray(), db.canvases.toArray(), db.assets.toArray()]),
   )
   const head = {
     app: APP,
@@ -29,6 +31,7 @@ export async function exportBackup(): Promise<{ file: File; summary: BackupSumma
     exportedAt: new Date().toISOString(),
     entries,
     works,
+    canvases,
   }
   const headJson = JSON.stringify(head)
   const parts: BlobPart[] = [headJson.slice(0, -1), ',"assets":[']
@@ -43,7 +46,7 @@ export async function exportBackup(): Promise<{ file: File; summary: BackupSumma
 
   const stamp = head.exportedAt.slice(0, 16).replace(/[-:T]/g, '')
   const file = new File(parts, `between-pages-backup-${stamp}.json`, { type: 'application/json' })
-  return { file, summary: { entries: entries.length, works: works.length, assets: assets.length } }
+  return { file, summary: { entries: entries.length, works: works.length, canvases: canvases.length, assets: assets.length } }
 }
 
 /**
@@ -57,7 +60,7 @@ export async function importBackup(file: File): Promise<BackupSummary> {
   } catch {
     throw new Error('无法读取文件，它不是有效的备份文件。')
   }
-  const b = raw as { app?: string; format?: number; entries?: unknown; works?: unknown; assets?: unknown }
+  const b = raw as { app?: string; format?: number; entries?: unknown; works?: unknown; canvases?: unknown; assets?: unknown }
   if (b?.app !== APP || typeof b.format !== 'number') throw new Error('这不是页间的备份文件。')
   if (b.format > BACKUP_FORMAT) throw new Error('这个备份来自更新版本的页间，请先更新应用。')
   if (!Array.isArray(b.entries) || !Array.isArray(b.assets)) throw new Error('备份文件内容不完整。')
@@ -70,12 +73,15 @@ export async function importBackup(file: File): Promise<BackupSummary> {
   const works = (Array.isArray(b.works) ? (b.works as Work[]) : []).filter(
     (w) => typeof w?.id === 'string' && typeof w.name === 'string',
   ).map((w) => ({ ...w, type: validTypes.has(w.type) ? w.type : 'other', coverAssetId: w.coverAssetId ?? null }))
+  const canvases = (Array.isArray(b.canvases) ? (b.canvases as CanvasDoc[]) : [])
+    .filter((c) => typeof c?.id === 'string' && typeof c.entryId === 'string')
+    .map(normalizeCanvas)
   const assets: Asset[] = (b.assets as BackupAsset[])
     .filter((a) => typeof a?.id === 'string' && typeof a.data === 'string')
     .map((a) => ({ ...a, data: fromBase64(a.data) }))
 
-  const added: BackupSummary = { entries: 0, works: 0, assets: 0 }
-  await db.transaction('rw', [db.entries, db.works, db.assets], async () => {
+  const added: BackupSummary = { entries: 0, works: 0, canvases: 0, assets: 0 }
+  await db.transaction('rw', [db.entries, db.works, db.canvases, db.assets], async () => {
     const existingAssets = new Set(await db.assets.toCollection().primaryKeys())
     const newAssets = assets.filter((a) => !existingAssets.has(a.id))
     await db.assets.bulkPut(newAssets)
@@ -90,6 +96,11 @@ export async function importBackup(file: File): Promise<BackupSummary> {
     const newerWorks = works.filter((w, i) => isNewer(w, localWorks[i]))
     await db.works.bulkPut(newerWorks)
     added.works = newerWorks.length
+
+    const localCanvases = await db.canvases.bulkGet(canvases.map((c) => c.id))
+    const newerCanvases = canvases.filter((c, i) => isNewer(c, localCanvases[i]))
+    await db.canvases.bulkPut(newerCanvases)
+    added.canvases = newerCanvases.length
   })
   return added
 }
