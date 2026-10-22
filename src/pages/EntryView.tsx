@@ -1,7 +1,7 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { db, deleteEntry } from '../db'
+import { db, deleteEntry, workTypeLabel } from '../db'
 import { formatDate, formatTime, useAssetUrl } from '../lib'
 
 export default function EntryView() {
@@ -40,6 +40,7 @@ export default function EntryView() {
       <h1 className={`mb-8 font-serif text-3xl leading-tight ${entry.title ? '' : 'text-mute'}`}>
         {entry.title || '无标题'}
       </h1>
+      <LinkedWorks ids={entry.workIds} />
       {entry.body && <div className="font-serif text-[17px] leading-loose whitespace-pre-wrap">{entry.body}</div>}
 
       {entry.imageIds.length > 0 && (
@@ -59,6 +60,23 @@ export default function EntryView() {
         </div>
       </footer>
     </article>
+  )
+}
+
+function LinkedWorks({ ids }: { ids: string[] }) {
+  const works = useLiveQuery(async () => (await db.works.bulkGet(ids)).filter((w) => w !== undefined), [ids.join()])
+  if (!works?.length) return null
+  return (
+    <ul className="mb-8 flex flex-wrap gap-2">
+      {works.map((w) => (
+        <li key={w.id}>
+          <Link to={`/work/${w.id}`} className="flex items-baseline gap-1.5 rounded-full border border-line px-3 py-1 text-sm">
+            <span className="font-serif">{w.name}</span>
+            <span className="text-xs text-mute">{workTypeLabel(w.type)}</span>
+          </Link>
+        </li>
+      ))}
+    </ul>
   )
 }
 

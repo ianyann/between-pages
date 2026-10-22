@@ -8,6 +8,9 @@ import Home from './pages/Home'
 import EntryList from './pages/EntryList'
 import EntryView from './pages/EntryView'
 import EntryEditor from './pages/EntryEditor'
+import Library from './pages/Library'
+import WorkView from './pages/WorkView'
+import WorkEditor from './pages/WorkEditor'
 
 requestPersistentStorage()
 
@@ -15,10 +18,14 @@ function Layout() {
   const { pathname } = useLocation()
   return (
     <div className="mx-auto min-h-dvh max-w-2xl px-5 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
-      {pathname !== '/' && !pathname.endsWith('/edit') && (
+      {pathname !== '/' && !pathname.endsWith('/edit') && pathname !== '/library/new' && (
         <nav className="flex items-baseline justify-between py-5">
           <Link to="/" className="font-serif text-base tracking-[0.2em]">页间</Link>
-          <Link to="/new" className="text-sm text-mute">+ 新建</Link>
+          <div className="flex gap-5 text-sm text-mute">
+            <Link to="/entries">日记</Link>
+            <Link to="/library">作品馆</Link>
+            <Link to="/new">+ 新建</Link>
+          </div>
         </nav>
       )}
       <Outlet />
@@ -42,6 +49,10 @@ createRoot(document.getElementById('root')!).render(
           <Route path="new" element={<NewEntry />} />
           <Route path="entry/:id" element={<EntryView />} />
           <Route path="entry/:id/edit" element={<EntryEditor />} />
+          <Route path="library" element={<Library />} />
+          <Route path="library/new" element={<WorkEditor />} />
+          <Route path="work/:id" element={<WorkView />} />
+          <Route path="work/:id/edit" element={<WorkEditor />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

@@ -39,7 +39,7 @@ const KEEP_ORIGINAL_BYTES = 1.5 * 1024 * 1024
  * 大图会缩放到长边 2400px 并转为 JPEG，避免手机照片撑满存储；
  * GIF 与解码失败的格式保留原文件。
  */
-export async function fileToAsset(file: File, entryId: string): Promise<Asset> {
+export async function fileToAsset(file: File, owner: { entryId?: string; workId?: string }): Promise<Asset> {
   let blob: Blob = file
   let width = 0
   let height = 0
@@ -70,7 +70,7 @@ export async function fileToAsset(file: File, entryId: string): Promise<Asset> {
 
   return {
     id: newId(),
-    entryId,
+    ...owner,
     data: await blob.arrayBuffer(),
     mimeType: blob.type || file.type || 'application/octet-stream',
     name: file.name,

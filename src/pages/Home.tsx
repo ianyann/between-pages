@@ -23,6 +23,11 @@ export default function Home() {
         >
           新建记录
         </Link>
+        <div className="mt-6">
+          <Link to="/library" className="text-sm tracking-wider text-mute">
+            作品馆 Library →
+          </Link>
+        </div>
       </header>
 
       <section>

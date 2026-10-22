@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { db, saveEntry, type Asset, type CanvasData, type EntryStatus } from '../db'
 import { assetToUrl, fileToAsset, formatClock, today } from '../lib'
+import WorkPicker from '../WorkPicker'
 
 interface Draft {
   title: string
@@ -9,6 +10,7 @@ interface Draft {
   entryDate: string
   status: EntryStatus
   imageIds: string[]
+  workIds: string[]
 }
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'error'
@@ -20,7 +22,7 @@ export default function EntryEditor() {
   const navigate = useNavigate()
 
   const [loaded, setLoaded] = useState(false)
-  const [draft, setDraft] = useState<Draft>({ title: '', body: '', entryDate: today(), status: 'draft', imageIds: [] })
+  const [draft, setDraft] = useState<Draft>({ title: '', body: '', entryDate: today(), status: 'draft', imageIds: [], workIds: [] })
   const [urls, setUrls] = useState<Record<string, string>>({})
   const [saveState, setSaveState] = useState<SaveState>('idle')
   const [dirty, setDirty] = useState(false)
@@ -33,11 +35,7 @@ export default function EntryEditor() {
   const draftRef = useRef(draft)
   const urlsRef = useRef(urls)
   urlsRef.current = urls
-  const meta = useRef<{ createdAt: number | null; canvas: CanvasData | null; workIds: string[] }>({
-    createdAt: null,
-    canvas: null,
-    workIds: [],
-  })
+  const meta = useRef<{ createdAt: number | null; canvas: CanvasData | null }>({ createdAt: null, canvas: null })
   const pendingAssets = useRef(new Map<string, Asset>()) // 新添加、尚未写入数据库的图片
   const removedIds = useRef(new Set<string>()) // 已从日记移除、待从数据库删除的图片
   const version = useRef(0)
@@ -54,13 +52,14 @@ export default function EntryEditor() {
       if (cancelled) return
       const loadedUrls: Record<string, string> = {}
       assets.forEach((a) => a && (loadedUrls[a.id] = assetToUrl(a)))
-      meta.current = { createdAt: entry.createdAt, canvas: entry.canvas, workIds: entry.workIds }
+      meta.current = { createdAt: entry.createdAt, canvas: entry.canvas ?? null }
       draftRef.current = {
         title: entry.title,
         body: entry.body,
         entryDate: entry.entryDate,
         status: entry.status,
         imageIds: entry.imageIds,
+        workIds: entry.workIds ?? [],
       }
       setDraft(draftRef.current)
       setUrls(loadedUrls)
@@ -95,7 +94,7 @@ export default function EntryEditor() {
         setSaveState('saving')
         try {
           await saveEntry(
-            { id, ...d, createdAt, updatedAt: now, canvas: meta.current.canvas, workIds: meta.current.workIds },
+            { id, ...d, createdAt, updatedAt: now, canvas: meta.current.canvas },
             newAssets,
             removed,
           )
@@ -168,7 +167,7 @@ export default function EntryEditor() {
     setProcessing((n) => n + list.length)
     for (const file of list) {
       try {
-        const asset = await fileToAsset(file, id)
+        const asset = await fileToAsset(file, { entryId: id })
         pendingAssets.current.set(asset.id, asset)
         setUrls((u) => ({ ...u, [asset.id]: assetToUrl(asset) }))
         update({ imageIds: [...draftRef.current.imageIds, asset.id] })
@@ -283,6 +282,8 @@ export default function EntryEditor() {
           }} />
         </label>
       </div>
+
+      <WorkPicker value={draft.workIds} onChange={(workIds) => update({ workIds })} />
     </div>
   )
 }
