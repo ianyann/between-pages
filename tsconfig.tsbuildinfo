@@ -1,1 +1,0 @@
-{"root":["./src/db.ts","./src/lib.ts","./src/main.tsx","./src/pages/EntryEditor.tsx","./src/pages/EntryList.tsx","./src/pages/EntryView.tsx","./src/pages/Home.tsx","./vite.config.ts"],"version":"5.9.3"}
