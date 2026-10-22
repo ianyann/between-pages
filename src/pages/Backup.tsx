@@ -32,7 +32,7 @@ export default function Backup() {
       const added = await importBackup(file)
       setImportStatus({
         kind: 'done',
-        text: added.entries + added.works + added.canvases + added.boxItems + added.assets === 0 ? '备份中的内容本机都已经有了，没有需要恢复的。' : `已恢复：${describe(added)}。`,
+        text: added.entries + added.works + added.canvases + added.boxItems + added.cutouts + added.assets === 0 ? '备份中的内容本机都已经有了，没有需要恢复的。' : `已恢复：${describe(added)}。`,
       })
     } catch (err) {
       console.error('导入失败', err)
@@ -95,4 +95,4 @@ function StatusLine({ status }: { status: Status }) {
 
 const formatSize = (n: number) => (n < 1024 * 1024 ? `${Math.max(1, Math.round(n / 1024))} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`)
 
-const describe = (s: BackupSummary) => `${s.entries} 篇日记、${s.works} 部作品、${s.canvases} 张画布、${s.boxItems} 个素材盒条目、${s.assets} 张图片`
+const describe = (s: BackupSummary) => `${s.entries} 篇日记、${s.works} 部作品、${s.canvases} 张画布、${s.boxItems} 个素材盒条目、${s.cutouts} 个剪裁、${s.assets} 张图片`

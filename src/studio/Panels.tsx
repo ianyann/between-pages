@@ -6,14 +6,17 @@ import {
   type BoxCategory,
   type BoxItem,
   type CanvasElement,
+  type DrawingElement,
   type Entry,
   type ImageElement,
+  type StrokeTool,
   type TextElement,
   type TextPreset,
   type TextStyle,
 } from '../db'
 import { useAssetUrl } from '../lib'
 import { ASSET_DRAG_TYPE } from './CanvasStage'
+import { INK_SWATCHES, TOOL_LABELS, type Brush } from './drawing'
 import { decorationAssetId, decorationPreview, DECORATION_GROUPS, DECORATIONS } from './decorations'
 import { BACKGROUND_SWATCHES, COLOR_SWATCHES, TEXT_PRESETS, type LayerMove } from './elements'
 
@@ -302,13 +305,16 @@ interface PropsPanelProps {
   onLayer: (move: LayerMove) => void
   onDelete: () => void
   onEditText: () => void
+  onCutout: () => void // 图片：打开剪裁
+  onDraw: () => void // 绘画层：继续绘画
+  isCutout: boolean // 图片是否为剪裁结果
 }
 
 export function PropsPanel(p: PropsPanelProps) {
   const { el } = p
   return (
     <div className="space-y-7">
-      {el.type === 'text' ? <TextProps {...p} el={el} /> : <ImageProps {...p} el={el} />}
+      {el.type === 'text' ? <TextProps {...p} el={el} /> : el.type === 'image' ? <ImageProps {...p} el={el} /> : <DrawingProps {...p} el={el} />}
 
       <Field label="图层">
         <div className="grid grid-cols-4 gap-1.5 text-xs">
@@ -405,9 +411,31 @@ function TextProps({ el, onPreview, onCommit, onEditText }: PropsPanelProps & { 
   )
 }
 
-function ImageProps({ el, naturalRatio, onPreview, onCommit }: PropsPanelProps & { el: ImageElement }) {
+function DrawingProps({ el, onPreview, onCommit, onDraw }: PropsPanelProps & { el: DrawingElement }) {
+  const count = el.strokes.filter((s) => s.tool !== 'eraser').length
   return (
     <>
+      <p className="text-sm">绘画层 · {count} 条笔迹</p>
+      <button onClick={onDraw} className="w-full border border-ink py-2 text-sm">继续在这一层绘画</button>
+      <Slider
+        label="整体不透明度"
+        value={Math.round(el.style.opacity * 100)}
+        min={5}
+        max={100}
+        format={(v) => `${v}%`}
+        onPreview={(v) => onPreview({ style: { opacity: v / 100 } } as Partial<DrawingElement>)}
+        onCommit={() => onCommit({})}
+      />
+    </>
+  )
+}
+
+function ImageProps({ el, naturalRatio, onPreview, onCommit, onCutout, isCutout }: PropsPanelProps & { el: ImageElement }) {
+  return (
+    <>
+      <button onClick={onCutout} className="w-full border border-ink py-2 text-sm">
+        {isCutout ? '继续编辑剪裁' : '剪裁（自由轮廓 / 擦除）'}
+      </button>
       <Slider
         label="不透明度"
         value={Math.round(el.style.opacity * 100)}
@@ -512,6 +540,68 @@ function ColorPicker({ swatches, value, onPreview, onCommit }: { swatches: strin
       <label className="relative h-7 w-7 cursor-pointer overflow-hidden rounded-full border border-line" title="自定义颜色" style={{ background: 'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)' }}>
         <input ref={inputRef} type="color" aria-label="自定义颜色" value={value.length === 7 ? value : '#373735'} onChange={(e) => onPreview(e.target.value)} className="absolute inset-0 opacity-0" />
       </label>
+    </div>
+  )
+}
+
+// —— 绘画工具条（浮在画布上方） ——
+
+export function DrawToolbar(p: {
+  tool: StrokeTool
+  brush: Brush
+  hasLayer: boolean
+  onTool: (t: StrokeTool) => void
+  onBrush: (b: Partial<Brush>) => void
+  onNewLayer: () => void
+  onClear: () => void
+  onDone: () => void
+}) {
+  const eraser = p.tool === 'eraser'
+  return (
+    <div
+      role="toolbar"
+      aria-label="绘画工具"
+      className="absolute inset-x-3 top-3 mx-auto flex max-w-3xl flex-wrap items-center gap-x-4 gap-y-2 rounded-2xl border border-line bg-paper/95 px-3 py-2 text-xs shadow-sm backdrop-blur"
+    >
+      <div className="flex overflow-hidden rounded-full border border-line">
+        {(['pen', 'marker', 'eraser'] as const).map((t) => (
+          <button key={t} onClick={() => p.onTool(t)} className={`px-3 py-1.5 ${p.tool === t ? 'bg-ink text-paper' : ''}`}>
+            {TOOL_LABELS[t]}
+          </button>
+        ))}
+      </div>
+      {!eraser && (
+        <div className="flex items-center gap-1.5">
+          {INK_SWATCHES.map((c) => (
+            <button
+              key={c}
+              onClick={() => p.onBrush({ color: c })}
+              aria-label={`笔色 ${c}`}
+              className={`h-5 w-5 rounded-full border ${p.brush.color.toLowerCase() === c.toLowerCase() ? 'ring-2 ring-ink ring-offset-1 ring-offset-paper' : 'border-line'}`}
+              style={{ background: c }}
+            />
+          ))}
+          <label className="relative h-5 w-5 cursor-pointer overflow-hidden rounded-full border border-line" style={{ background: 'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)' }}>
+            <input type="color" aria-label="自定义笔色" value={p.brush.color} onChange={(e) => p.onBrush({ color: e.target.value })} className="absolute inset-0 opacity-0" />
+          </label>
+        </div>
+      )}
+      <label className="flex items-center gap-1.5">
+        <span className="text-mute">粗细</span>
+        <input type="range" aria-label="笔刷粗细" min={1} max={eraser ? 120 : 80} value={p.brush.width} onChange={(e) => p.onBrush({ width: Number(e.target.value) })} className="w-20 accent-ink" />
+        <span className="w-6 tabular-nums">{p.brush.width}</span>
+      </label>
+      {!eraser && (
+        <label className="flex items-center gap-1.5">
+          <span className="text-mute">透明度</span>
+          <input type="range" aria-label="笔刷不透明度" min={10} max={100} value={Math.round(p.brush.opacity * 100)} onChange={(e) => p.onBrush({ opacity: Number(e.target.value) / 100 })} className="w-16 accent-ink" />
+        </label>
+      )}
+      <div className="ml-auto flex items-center gap-3">
+        <button onClick={p.onNewLayer} className="text-mute underline">新绘画层</button>
+        <button onClick={p.onClear} disabled={!p.hasLayer} className="text-red-700 disabled:opacity-30">清除本层</button>
+        <button onClick={p.onDone} className="rounded-full bg-ink px-3 py-1.5 text-paper">完成</button>
+      </div>
     </div>
   )
 }

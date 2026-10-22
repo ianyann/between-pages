@@ -1,7 +1,8 @@
 import Konva from 'konva'
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react'
-import { Image as KImage, Layer, Rect, Stage, Text as KText, Transformer } from 'react-konva'
-import { CANVAS_HEIGHT, CANVAS_WIDTH, DESK, type CanvasElement, type TextElement } from '../db'
+import { Group, Image as KImage, Layer, Line, Rect, Stage, Text as KText, Transformer } from 'react-konva'
+import { CANVAS_HEIGHT, CANVAS_WIDTH, DESK, type CanvasElement, type DrawingElement, type Stroke, type TextElement } from '../db'
+import { appendPoint, cacheDrawingGroup, eraseOnCache, strokeAttrs, type Brush } from './drawing'
 import { FONT_STACKS, scaleRotateAroundCenter, textAttrs, type LayerMove, type StudioDoc } from './elements'
 
 // 一根手指拖动元素时，第二根手指落下仍能触发事件（双指缩放需要）
@@ -62,11 +63,23 @@ interface Props {
   onLayer: (id: string, move: LayerMove) => void
   onDelete: (id: string) => void
   onDropAsset: (assetId: string, world: { x: number; y: number }) => void
+  // —— 绘画模式 ——
+  drawMode: boolean
+  brush: Brush
+  drawLayerId: string | null // 当前绘画层；橡皮只作用于它
+  onStroke: (stroke: Omit<Stroke, 'id'>) => void // 世界坐标的一条完整笔画
+  onCutout: (id: string) => void
+  onDrawLayer: (id: string) => void
 }
 
+const DPR = typeof devicePixelRatio === 'number' ? devicePixelRatio : 1
+/** 缓存倍率按 2 的幂取整：缩放时只在跨过档位时重新缓存，避免频繁重绘。 */
+const cacheRatio = (zoom: number) => Math.pow(2, Math.ceil(Math.log2(Math.max(0.125, zoom * DPR))))
+
 export default function CanvasStage(props: Props) {
-  const { doc, width, height, view, images, selectedId, editingId } = props
+  const { doc, width, height, view, images, selectedId, editingId, drawMode } = props
   const stageRef = useRef<Konva.Stage>(null)
+  const liveLayerRef = useRef<Konva.Layer>(null)
   const trRef = useRef<Konva.Transformer>(null)
   const selected = doc.elements.find((el) => el.id === selectedId)
   const [interacting, setInteracting] = useState(false) // 拖动 / 变换 / 双指中隐藏快捷操作
@@ -118,10 +131,11 @@ export default function CanvasStage(props: Props) {
 
   function onTouchStart(e: Konva.KonvaEventObject<TouchEvent>) {
     if (e.evt.touches.length === 2) {
+      cancelLiveStroke() // 第二根手指落下：取消正在画的一笔，改为缩放 / 平移视图
       const stage = stageRef.current!
       stage.stopDrag()
       const t = touchInfo(e.evt)
-      if (selected) {
+      if (selected && selected.type !== 'drawing') {
         stage.findOne('#' + selected.id)?.stopDrag()
         pinch.current = { kind: 'element', dist: t.dist, angle: t.angle, el: selected }
       } else {
@@ -131,7 +145,100 @@ export default function CanvasStage(props: Props) {
       setInteracting(true)
       return
     }
-    deselectOnEmpty(e)
+    if (!drawMode) deselectOnEmpty(e)
+  }
+
+  // —— 绘画：笔画进行中不写数据，直接画在画布上；抬笔时提交一整条 ——
+  const live = useRef<{ pointerId: number; line?: Konva.Line; points: number[]; world: number[]; brush: Brush; group?: Konva.Group } | null>(null)
+  const lastRecache = useRef(0)
+  const penSeen = useRef(false) // 检测到触控笔后，手指触摸不再落笔（防手掌误触）
+  const recacheFrame = useRef(0)
+
+  function drawLayerNode() {
+    const el = doc.elements.find((e): e is DrawingElement => e.id === props.drawLayerId && e.type === 'drawing')
+    const group = el && (stageRef.current?.findOne('#' + el.id) as Konva.Group | undefined)
+    return el && group ? { el, group } : null
+  }
+
+  function onPointerDown(e: Konva.KonvaEventObject<PointerEvent>) {
+    if (!drawMode || live.current) return
+    const ev = e.evt
+    if (ev.pointerType === 'pen') penSeen.current = true
+    if (ev.pointerType === 'touch' && penSeen.current) return
+    if (ev.pointerType === 'mouse' && ev.button !== 0) return
+    const stage = stageRef.current!
+    const p = stage.getRelativePointerPosition()!
+    const brush = props.brush
+    if (brush.tool === 'eraser') {
+      const target = drawLayerNode()
+      if (!target) return
+      const local: [number, number] = [p.x - target.el.x, p.y - target.el.y]
+      // 落笔时确保本层已缓存，之后每段擦除直接画在缓存上
+      cacheDrawingGroup(target.group, target.el, cacheRatio(view.zoom), undefined, true)
+      eraseOnCache(target.group, local, local, brush.width)
+      target.group.getLayer()?.batchDraw()
+      live.current = { pointerId: ev.pointerId, points: [...local], world: [p.x, p.y], brush, group: target.group }
+    } else {
+      const line = new Konva.Line(strokeAttrs({ id: '', ...brush, points: [p.x, p.y, p.x, p.y] }))
+      liveLayerRef.current!.add(line)
+      live.current = { pointerId: ev.pointerId, line, points: [p.x, p.y], world: [p.x, p.y], brush }
+    }
+    // 触摸指针由浏览器自动捕获；鼠标与触控笔需要显式捕获，拖出画布也能继续
+    if (ev.pointerType !== 'touch') (stage.content as HTMLElement).setPointerCapture?.(ev.pointerId)
+    live.current.line?.getLayer()?.batchDraw()
+  }
+
+  function onPointerMove(e: Konva.KonvaEventObject<PointerEvent>) {
+    const l = live.current
+    if (!l || e.evt.pointerId !== l.pointerId) return
+    const p = stageRef.current!.getRelativePointerPosition()!
+    const minDist = 1.2 / view.zoom
+    if (!appendPoint(l.world, p.x, p.y, minDist)) return
+    if (l.group) {
+      const target = drawLayerNode()!
+      const n = l.points.length
+      const from: [number, number] = [l.points[n - 2], l.points[n - 1]]
+      appendPoint(l.points, p.x - target.el.x, p.y - target.el.y, 0)
+      const to: [number, number] = [l.points[l.points.length - 2], l.points[l.points.length - 1]]
+      if (eraseOnCache(l.group, from, to, l.brush.width)) {
+        l.group.getLayer()?.batchDraw()
+      } else if (performance.now() - lastRecache.current > 120) {
+        // 退回方案：限制整层重建的频率
+        lastRecache.current = performance.now()
+        cancelAnimationFrame(recacheFrame.current)
+        recacheFrame.current = requestAnimationFrame(() => {
+          const t = drawLayerNode()
+          if (!t) return
+          const tmp = new Konva.Line(strokeAttrs({ id: '', tool: 'eraser', color: '', width: l.brush.width, opacity: 1, points: [...l.points] }))
+          t.group.add(tmp)
+          cacheDrawingGroup(t.group, t.el, cacheRatio(view.zoom), undefined, true)
+          tmp.destroy()
+        })
+      }
+    } else {
+      l.line!.points(l.world)
+      l.line!.getLayer()?.batchDraw()
+    }
+  }
+
+  function onPointerUp(e: Konva.KonvaEventObject<PointerEvent>) {
+    const l = live.current
+    if (!l || e.evt.pointerId !== l.pointerId) return
+    live.current = null
+    cancelAnimationFrame(recacheFrame.current)
+    l.line?.destroy()
+    const pts = l.world.length === 2 ? [...l.world, ...l.world] : l.world // 单击也留下一个点
+    props.onStroke({ tool: l.brush.tool, color: l.brush.color, width: l.brush.width, opacity: l.brush.opacity, points: pts })
+  }
+
+  function cancelLiveStroke() {
+    const l = live.current
+    if (!l) return
+    live.current = null
+    l.line?.destroy()
+    const t = drawLayerNode()
+    if (t) cacheDrawingGroup(t.group, t.el, cacheRatio(view.zoom))
+    liveLayerRef.current?.batchDraw()
   }
 
   function onTouchMove(e: Konva.KonvaEventObject<TouchEvent>) {
@@ -170,7 +277,7 @@ export default function CanvasStage(props: Props) {
     const base = { x: node.x(), y: node.y(), rotation: node.rotation() }
     if (el.type === 'image') {
       props.onCommit(el.id, { ...base, width: Math.max(10, node.width() * sx), height: Math.max(10, node.height() * sy) })
-    } else {
+    } else if (el.type === 'text') {
       const k = Math.abs(sy - 1) > 0.001 ? sy : 1 // 角点缩放时字号同比变化，侧边只改宽度
       props.onCommit(el.id, {
         ...base,
@@ -201,7 +308,8 @@ export default function CanvasStage(props: Props) {
     x: el.x,
     y: el.y,
     rotation: el.rotation,
-    draggable: editingId !== el.id,
+    draggable: editingId !== el.id && !drawMode, // 绘画模式下禁用拖动
+    listening: !drawMode,
     onMouseDown: () => props.onSelect(el.id),
     onTap: () => props.onSelect(el.id),
     onDragStart: () => {
@@ -211,11 +319,13 @@ export default function CanvasStage(props: Props) {
     onDragEnd: (e: Konva.KonvaEventObject<DragEvent>) => {
       e.cancelBubble = true // 不当作平移桌面
       setInteracting(false)
-      props.onCommit(el.id, clampToDesk(el, e.target.x(), e.target.y()))
+      props.onCommit(el.id, el.type === 'drawing' ? { x: e.target.x(), y: e.target.y() } : clampToDesk(el, e.target.x(), e.target.y()))
     },
     onTransformStart: () => setInteracting(true),
     onTransformEnd: (e: Konva.KonvaEventObject<Event>) => commitNode(el, e.target),
   })
+
+  const isDrawing = selected?.type === 'drawing'
 
   // —— 快捷操作条：放在元素与旋转手柄上方，空间不足时放在下方，不遮挡元素 ——
   const toolbarRef = useRef<HTMLDivElement>(null)
@@ -239,7 +349,7 @@ export default function CanvasStage(props: Props) {
   return (
     <div
       className="relative overflow-hidden"
-      style={{ width, height, touchAction: 'none' }}
+      style={{ width, height, touchAction: 'none', cursor: drawMode ? 'crosshair' : undefined }}
       onDragOver={(e) => e.dataTransfer.types.includes(ASSET_DRAG_TYPE) && e.preventDefault()}
       onDrop={(e) => {
         const assetId = e.dataTransfer.getData(ASSET_DRAG_TYPE)
@@ -257,7 +367,7 @@ export default function CanvasStage(props: Props) {
         y={view.y}
         scaleX={view.zoom}
         scaleY={view.zoom}
-        draggable // 在空白处拖动 = 平移桌面
+        draggable={!drawMode} // 在空白处拖动 = 平移桌面；绘画模式下拖动是画线
         dragBoundFunc={(pos) => {
           const v = clampView({ ...view, x: pos.x, y: pos.y }, width, height)
           return { x: v.x, y: v.y }
@@ -269,7 +379,11 @@ export default function CanvasStage(props: Props) {
           if (e.target === stageRef.current) props.onViewChange({ ...view, x: e.target.x(), y: e.target.y() })
         }}
         onWheel={onWheel}
-        onMouseDown={deselectOnEmpty}
+        onMouseDown={(e) => !drawMode && deselectOnEmpty(e)}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
@@ -293,6 +407,8 @@ export default function CanvasStage(props: Props) {
               ) : (
                 <Rect key={el.id} {...common(el)} width={el.width} height={el.height} fill="#d6d2c8" opacity={el.style.opacity} />
               )
+            ) : el.type === 'drawing' ? (
+              <DrawingNode key={el.id} el={el} ratio={cacheRatio(view.zoom)} common={common(el)} />
             ) : (
               <KText
                 key={el.id}
@@ -320,7 +436,8 @@ export default function CanvasStage(props: Props) {
             ref={trRef}
             keepRatio
             flipEnabled={false}
-            enabledAnchors={selected?.type === 'text' ? [...CORNER_ANCHORS, ...TEXT_SIDE_ANCHORS] : CORNER_ANCHORS}
+            enabledAnchors={isDrawing ? [] : selected?.type === 'text' ? [...CORNER_ANCHORS, ...TEXT_SIDE_ANCHORS] : CORNER_ANCHORS}
+            rotateEnabled={!isDrawing} // 绘画层只能整体移动
             rotationSnaps={[0, 90, 180, 270]}
             rotationSnapTolerance={4}
             anchorSize={ANCHOR_SIZE}
@@ -335,19 +452,23 @@ export default function CanvasStage(props: Props) {
             boundBoxFunc={(oldBox, box) => (Math.abs(box.width) < 24 || Math.abs(box.height) < 12 ? oldBox : box)}
           />
         </Layer>
+        {/* 正在画的一笔（细笔 / 马克笔）先画在最上层，抬笔后进入对应绘画层 */}
+        <Layer ref={liveLayerRef} listening={false} />
       </Stage>
 
-      {selected && !editing && (
+      {selected && !editing && !drawMode && (
         <div
           ref={toolbarRef}
           role="toolbar"
           aria-label="快捷操作"
-          className="absolute flex divide-x divide-line rounded-full border border-line bg-paper/95 text-xs shadow-sm backdrop-blur"
+          className="absolute z-20 flex divide-x divide-line rounded-full border border-line bg-paper/95 text-xs shadow-sm backdrop-blur"
           style={{ left: toolbarPos?.left ?? -9999, top: toolbarPos?.top ?? -9999, visibility: toolbarPos ? 'visible' : 'hidden' }}
           onMouseDown={(e) => e.stopPropagation()}
         >
           {(
             [
+              ...(selected.type === 'image' ? ([['剪裁', () => props.onCutout(selected.id)]] as const) : []),
+              ...(selected.type === 'drawing' ? ([['绘画', () => props.onDrawLayer(selected.id)]] as const) : []),
               ['复制', () => props.onDuplicate(selected.id)],
               ['上移', () => props.onLayer(selected.id, 'up')],
               ['下移', () => props.onLayer(selected.id, 'down')],
@@ -367,6 +488,21 @@ export default function CanvasStage(props: Props) {
         <TextEditor key={editing.id} el={editing} view={view} onDone={(text) => props.onEditEnd(editing.id, text)} />
       )}
     </div>
+  )
+}
+
+/** 绘画层：一组笔画。含橡皮笔迹时缓存为独立画布，橡皮只擦本层。 */
+function DrawingNode({ el, ratio, common }: { el: DrawingElement; ratio: number; common: Record<string, unknown> }) {
+  const ref = useRef<Konva.Group>(null)
+  useEffect(() => {
+    if (ref.current) cacheDrawingGroup(ref.current, el, ratio)
+  }, [el, ratio])
+  return (
+    <Group ref={ref} {...common} opacity={el.style.opacity}>
+      {el.strokes.map((s) => (
+        <Line key={s.id} {...strokeAttrs(s)} />
+      ))}
+    </Group>
   )
 }
 

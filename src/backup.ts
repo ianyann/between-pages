@@ -1,10 +1,10 @@
-import { BOX_CATEGORIES, db, DB_VERSION, fillEntryDefaults, normalizeCanvas, WORK_TYPES, type Asset, type BoxItem, type CanvasDoc, type Entry, type Work } from './db'
+import { BOX_CATEGORIES, db, DB_VERSION, fillEntryDefaults, normalizeCanvas, WORK_TYPES, type Asset, type BoxItem, type CanvasDoc, type Cutout, type Entry, type Work } from './db'
 
 /**
  * 备份文件格式（JSON）：
  * { app, format, dbVersion, exportedAt, entries, works, canvases, boxItems, assets }
- * works（v2 起）、canvases（v3 起）、boxItems（v4 起）为可选，旧备份没有这些项也能导入。
- * assets[].data 与 boxItems[].thumb 为 base64 编码的二进制。
+ * works（v2 起）、canvases（v3 起）、boxItems（v4 起）、cutouts（v5 起）为可选，旧备份没有这些项也能导入。
+ * assets[].data、boxItems[].thumb、cutouts[].mask 为 base64 编码的二进制。
  * format 只在文件结构本身变化时递增；dbVersion 记录导出时的数据库版本，导入时据此补全旧字段。
  */
 export const BACKUP_FORMAT = 1
@@ -12,22 +12,27 @@ const APP = 'between-pages'
 
 type BackupAsset = Omit<Asset, 'data'> & { data: string }
 type BackupBoxItem = Omit<BoxItem, 'thumb'> & { thumb: string }
+type BackupCutout = Omit<Cutout, 'mask'> & { mask: string }
 
 export interface BackupSummary {
   entries: number
   works: number
   canvases: number
   boxItems: number
+  cutouts: number
   assets: number
 }
 
 /** 生成备份文件。逐段拼接成 Blob，避免把全部图片拼成一个超长字符串。 */
 export async function exportBackup(): Promise<{ file: File; summary: BackupSummary }> {
-  const [entries, works, canvases, boxItems, assets] = await db.transaction(
+  const [entries, works, canvases, boxItems, cutouts, assets] = await db.transaction(
     'r',
-    [db.entries, db.works, db.canvases, db.boxItems, db.assets],
-    () => Promise.all([db.entries.toArray(), db.works.toArray(), db.canvases.toArray(), db.boxItems.toArray(), db.assets.toArray()]),
+    [db.entries, db.works, db.canvases, db.boxItems, db.cutouts, db.assets],
+    () =>
+      Promise.all([db.entries.toArray(), db.works.toArray(), db.canvases.toArray(), db.boxItems.toArray(), db.cutouts.toArray(), db.assets.toArray()]),
   )
+  const cutoutsForBackup: BackupCutout[] = []
+  for (const c of cutouts) cutoutsForBackup.push({ ...c, mask: await toBase64(c.mask) })
   const boxForBackup: BackupBoxItem[] = []
   for (const b of boxItems) boxForBackup.push({ ...b, thumb: await toBase64(b.thumb) })
   const head = {
@@ -39,6 +44,7 @@ export async function exportBackup(): Promise<{ file: File; summary: BackupSumma
     works,
     canvases,
     boxItems: boxForBackup,
+    cutouts: cutoutsForBackup,
   }
   const headJson = JSON.stringify(head)
   const parts: BlobPart[] = [headJson.slice(0, -1), ',"assets":[']
@@ -53,7 +59,7 @@ export async function exportBackup(): Promise<{ file: File; summary: BackupSumma
 
   const stamp = head.exportedAt.slice(0, 16).replace(/[-:T]/g, '')
   const file = new File(parts, `between-pages-backup-${stamp}.json`, { type: 'application/json' })
-  return { file, summary: { entries: entries.length, works: works.length, canvases: canvases.length, boxItems: boxItems.length, assets: assets.length } }
+  return { file, summary: { entries: entries.length, works: works.length, canvases: canvases.length, boxItems: boxItems.length, cutouts: cutouts.length, assets: assets.length } }
 }
 
 /**
@@ -67,7 +73,7 @@ export async function importBackup(file: File): Promise<BackupSummary> {
   } catch {
     throw new Error('无法读取文件，它不是有效的备份文件。')
   }
-  const b = raw as { app?: string; format?: number; entries?: unknown; works?: unknown; canvases?: unknown; boxItems?: unknown; assets?: unknown }
+  const b = raw as { app?: string; format?: number; entries?: unknown; works?: unknown; canvases?: unknown; boxItems?: unknown; cutouts?: unknown; assets?: unknown }
   if (b?.app !== APP || typeof b.format !== 'number') throw new Error('这不是页间的备份文件。')
   if (b.format > BACKUP_FORMAT) throw new Error('这个备份来自更新版本的页间，请先更新应用。')
   if (!Array.isArray(b.entries) || !Array.isArray(b.assets)) throw new Error('备份文件内容不完整。')
@@ -87,12 +93,15 @@ export async function importBackup(file: File): Promise<BackupSummary> {
   const boxItems: BoxItem[] = (Array.isArray(b.boxItems) ? (b.boxItems as BackupBoxItem[]) : [])
     .filter((x) => typeof x?.id === 'string' && typeof x.thumb === 'string')
     .map((x) => ({ ...x, category: categories.has(x.category) ? x.category : '其他', thumb: fromBase64(x.thumb) }))
+  const cutouts: Cutout[] = (Array.isArray(b.cutouts) ? (b.cutouts as BackupCutout[]) : [])
+    .filter((c) => typeof c?.id === 'string' && typeof c.sourceAssetId === 'string' && typeof c.mask === 'string')
+    .map((c) => ({ ...c, path: Array.isArray(c.path) ? c.path : [], mask: fromBase64(c.mask) }))
   const assets: Asset[] = (b.assets as BackupAsset[])
     .filter((a) => typeof a?.id === 'string' && typeof a.data === 'string')
     .map((a) => ({ ...a, data: fromBase64(a.data) }))
 
-  const added: BackupSummary = { entries: 0, works: 0, canvases: 0, boxItems: 0, assets: 0 }
-  await db.transaction('rw', [db.entries, db.works, db.canvases, db.boxItems, db.assets], async () => {
+  const added: BackupSummary = { entries: 0, works: 0, canvases: 0, boxItems: 0, cutouts: 0, assets: 0 }
+  await db.transaction('rw', [db.entries, db.works, db.canvases, db.boxItems, db.cutouts, db.assets], async () => {
     const existingAssets = new Set(await db.assets.toCollection().primaryKeys())
     const newAssets = assets.filter((a) => !existingAssets.has(a.id))
     await db.assets.bulkPut(newAssets)
@@ -118,6 +127,11 @@ export async function importBackup(file: File): Promise<BackupSummary> {
     const newBox = boxItems.filter((_, i) => !localBox[i])
     await db.boxItems.bulkPut(newBox)
     added.boxItems = newBox.length
+
+    const localCutouts = await db.cutouts.bulkGet(cutouts.map((c) => c.id))
+    const newerCutouts = cutouts.filter((c, i) => isNewer(c, localCutouts[i]))
+    await db.cutouts.bulkPut(newerCutouts)
+    added.cutouts = newerCutouts.length
   })
   return added
 }

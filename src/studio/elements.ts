@@ -9,6 +9,7 @@ import {
   type TextStyle,
 } from '../db'
 import { newId } from '../lib'
+import { cloneStrokes, withDrawingBounds } from './drawing'
 
 /** 画布可编辑的部分（撤销 / 重做的快照单位）。 */
 export interface StudioDoc {
@@ -130,9 +131,10 @@ export function addElement(els: CanvasElement[], el: CanvasElement): CanvasEleme
   return renumber([...els, el])
 }
 
-/** 复制：新的元素 ID，共用同一素材，略微错开并放在最上层。 */
+/** 复制：新的元素 ID，共用同一素材（绘画层的每条笔画也换新 ID），略微错开并放在最上层。 */
 export function duplicateElement(el: CanvasElement): CanvasElement {
-  return { ...el, id: newId(), x: el.x + 24, y: el.y + 24 }
+  const copy = { ...el, id: newId(), x: el.x + 24, y: el.y + 24 }
+  return copy.type === 'drawing' ? { ...copy, strokes: cloneStrokes(copy.strokes) } : copy
 }
 
 export function removeElement(els: CanvasElement[], id: string): CanvasElement[] {
@@ -143,7 +145,7 @@ export function patchElement(els: CanvasElement[], id: string, patch: Partial<Ca
   return els.map((el) => {
     if (el.id !== id) return el
     const next = { ...el, ...patch } as CanvasElement
-    return next.type === 'text' ? withMeasuredHeight(next) : next
+    return next.type === 'text' ? withMeasuredHeight(next) : next.type === 'drawing' ? withDrawingBounds(next) : next
   })
 }
 

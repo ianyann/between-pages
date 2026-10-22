@@ -10,16 +10,23 @@ import {
   db,
   loadCanvas,
   newCanvasId,
+  rebaseCutoutInCanvases,
+  rebaseImageElement,
   saveCanvas,
   type BoxCategory,
   type CanvasElement,
+  type DrawingElement,
+  type ImageElement,
+  type Stroke,
+  type StrokeTool,
   type TextElement,
   type TextPreset,
 } from '../db'
-import { fileToAsset, formatClock, makeThumb, shareOrDownload, today } from '../lib'
+import { fileToAsset, formatClock, makeThumb, newId, shareOrDownload, today } from '../lib'
 import { ensureDecorationAsset, findDecoration } from './decorations'
 import CanvasStage, { clampView, MAX_ZOOM, MIN_ZOOM, type View } from './CanvasStage'
 import { exportPaperPng } from './exportPng'
+import CutoutEditor, { type CutoutResult } from './CutoutEditor'
 import {
   addElement,
   createImage,
@@ -32,7 +39,8 @@ import {
   type Point,
   type StudioDoc,
 } from './elements'
-import { ADD_TABS, AddPanel, BackgroundPanel, PropsPanel, type AddTab } from './Panels'
+import { ADD_TABS, AddPanel, BackgroundPanel, DrawToolbar, PropsPanel, type AddTab } from './Panels'
+import { BRUSH_DEFAULTS, createDrawing } from './drawing'
 
 const AUTOSAVE_DELAY = 1000
 const BOX_TYPES = ['image/jpeg', 'image/png', 'image/webp']
@@ -56,6 +64,14 @@ export default function Studio() {
   const [drawer, setDrawer] = useState<Drawer>(null)
   const [importing, setImporting] = useState(0)
   const [hint, setHint] = useState('')
+  // —— 绘画模式 ——
+  const [drawMode, setDrawMode] = useState(false)
+  const [tool, setTool] = useState<StrokeTool>('pen')
+  const [brushes, setBrushes] = useState(BRUSH_DEFAULTS)
+  const [drawLayerId, setDrawLayerId] = useState<string | null>(null)
+  // —— 剪裁 ——
+  const [cutoutFor, setCutoutFor] = useState<string | null>(null) // 正在剪裁的图片元素 ID
+  const [cutoutTarget, setCutoutTarget] = useState<{ elId: string; sourceAssetId: string; cutoutId: string | null } | null>(null)
 
   // —— 撤销 / 重做：保存整份快照；预览中的变化（拖滑块等）结束时才记一步 ——
   const presentRef = useRef(present)
@@ -235,6 +251,7 @@ export default function Studio() {
 
   // —— 元素操作 ——
   const selected = present.elements.find((el) => el.id === selectedId) ?? null
+  const cutoutIds = new Set(useLiveQuery(() => db.cutouts.toCollection().primaryKeys(), []) ?? [])
 
   function add(el: CanvasElement) {
     update((d) => ({ ...d, elements: addElement(d.elements, el) }))
@@ -250,6 +267,100 @@ export default function Studio() {
     const deco = findDecoration(assetId) // 装饰按设计尺寸放置（素材本身是 2 倍分辨率）
     const [w, h] = deco ? [deco.width, deco.height] : [img.naturalWidth, img.naturalHeight]
     add(createImage(assetId, w, h, presentRef.current.elements.length, at ?? viewCenter(), exact))
+  }
+
+  /** 进入绘画模式：继续指定的绘画层，否则最上面的绘画层；都没有时在第一笔时新建。 */
+  function enterDraw(layerId?: string) {
+    const layers = presentRef.current.elements.filter((e) => e.type === 'drawing')
+    setDrawLayerId(layerId ?? layers.at(-1)?.id ?? null)
+    setSelectedId(null)
+    setEditingId(null)
+    setDrawMode(true)
+    if (!wide) setDrawer(null)
+  }
+
+  function exitDraw() {
+    setDrawMode(false)
+  }
+
+  /** 一条完整笔画（世界坐标）→ 转为绘画层坐标后加入该层，记为一步撤销。 */
+  function addStroke(s: Omit<Stroke, 'id'>) {
+    const cur = presentRef.current
+    let layerEl = cur.elements.find((e): e is DrawingElement => e.id === drawLayerId && e.type === 'drawing')
+    if (!layerEl && s.tool === 'eraser') return // 当前没有绘画层，橡皮无事可做
+    const isNew = !layerEl
+    if (!layerEl) layerEl = createDrawing(cur.elements.length)
+    const stroke: Stroke = { ...s, id: newId(), points: s.points.map((v, i) => Math.round((v - (i % 2 ? layerEl!.y : layerEl!.x)) * 10) / 10) }
+    const target = layerEl
+    update((d) => {
+      const elements = isNew ? addElement(d.elements, target) : d.elements
+      return { ...d, elements: patchElement(elements, target.id, { strokes: [...target.strokes, stroke] } as Partial<DrawingElement>) }
+    })
+    if (isNew) setDrawLayerId(target.id)
+  }
+
+  function clearDrawLayer() {
+    if (!drawLayerId) return
+    update((d) => ({ ...d, elements: removeElement(d.elements, drawLayerId) }))
+    setDrawLayerId(null)
+  }
+
+  function newDrawLayer() {
+    setDrawLayerId(null) // 下一笔会在最上层新建绘画层
+  }
+
+  // 打开剪裁：普通图片 → 新剪裁；剪裁结果 → 用原图和保存的遮罩继续编辑
+  useEffect(() => {
+    if (!cutoutFor) return setCutoutTarget(null)
+    const el = presentRef.current.elements.find((e) => e.id === cutoutFor)
+    if (el?.type !== 'image') return setCutoutFor(null)
+    db.cutouts.get(el.assetId).then((c) =>
+      setCutoutTarget(c ? { elId: el.id, sourceAssetId: c.sourceAssetId, cutoutId: c.id } : { elId: el.id, sourceAssetId: el.assetId, cutoutId: null }),
+    )
+  }, [cutoutFor])
+
+  /** 重新读取某张图片（剪裁结果被修改后）。 */
+  function reloadImage(assetId: string) {
+    imageJobs.current.delete(assetId)
+    setImages((m) => {
+      const next = new Map(m)
+      next.delete(assetId)
+      return next
+    })
+    ensureImage(assetId)
+  }
+
+  async function onCutoutSaved(r: CutoutResult) {
+    const target = cutoutTarget!
+    setCutoutFor(null)
+    reloadImage(r.assetId)
+    const src = presentRef.current.elements.find((e): e is ImageElement => e.id === target.elId && e.type === 'image')
+    if (r.isNew) {
+      // 按原图元素的比例放在它旁边，便于对照
+      const img = src && (await ensureImage(src.assetId))
+      const k = src && img ? src.width / img.naturalWidth : 0.5
+      const el: ImageElement = {
+        id: newId(),
+        type: 'image',
+        assetId: r.assetId,
+        x: (src?.x ?? 0) + r.newBox.x * k + 40,
+        y: (src?.y ?? 0) + r.newBox.y * k + 40,
+        width: r.newBox.width * k,
+        height: r.newBox.height * k,
+        rotation: 0,
+        z: presentRef.current.elements.length,
+        style: { opacity: 1 },
+      }
+      add(el)
+    } else if (r.oldBox) {
+      const oldBox = r.oldBox
+      // 可见范围变了：所有用到它的元素同步调整，人物在画面中保持原位
+      update((d) => ({
+        ...d,
+        elements: d.elements.map((e) => (e.type === 'image' && e.assetId === r.assetId ? rebaseImageElement(e, oldBox, r.newBox) : e)),
+      }))
+      await rebaseCutoutInCanvases(r.assetId, oldBox, r.newBox, newCanvasId(id)).catch((err) => console.error('更新其他画布失败', err))
+    }
   }
 
   function duplicate(elId: string) {
@@ -325,6 +436,7 @@ export default function Studio() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.isComposing || e.keyCode === 229) return
+      if (cutoutTarget) return // 剪裁界面打开时由它处理快捷键
       const t = e.target as HTMLElement | null
       if (t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName))) return
       const mod = e.metaKey || e.ctrlKey
@@ -343,6 +455,7 @@ export default function Studio() {
         remove(selectedId)
       } else if (e.key === 'Escape') {
         setSelectedId(null)
+        setDrawMode(false)
       } else if (e.key === 'Enter' && selected?.type === 'text') {
         e.preventDefault()
         setEditingId(selected.id)
@@ -355,7 +468,7 @@ export default function Studio() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [undo, redo, remove, patch, selected, selectedId])
+  }, [undo, redo, remove, patch, selected, selectedId, cutoutTarget])
 
   // —— 视图：容器尺寸 + 缩放平移。只影响显示；窗口变化时保持画面中心不动，元素数据不变 ——
   const [box, setBox] = useState<HTMLDivElement | null>(null)
@@ -444,6 +557,9 @@ export default function Studio() {
         setEditingId(selected.id)
         if (!wide) setDrawer(null)
       }}
+      onCutout={() => setCutoutFor(selected.id)}
+      onDraw={() => enterDraw(selected.id)}
+      isCutout={selected.type === 'image' && cutoutIds.has(selected.assetId)}
     />
   )
   const backgroundPanel = (
@@ -467,6 +583,12 @@ export default function Studio() {
           onLayer={layer}
           onDelete={remove}
           onDropAsset={(assetId, at) => addImage(assetId, at, true)}
+          drawMode={drawMode}
+          brush={brushes[tool]}
+          drawLayerId={drawLayerId}
+          onStroke={addStroke}
+          onCutout={(elId) => setCutoutFor(elId)}
+          onDrawLayer={(elId) => enterDraw(elId)}
           images={images}
           selectedId={selectedId}
           editingId={editingId}
@@ -483,6 +605,26 @@ export default function Studio() {
           onCommit={(elId, p) => patch(elId, p)}
         />
       )}
+      {view &&
+        (drawMode ? (
+          <DrawToolbar
+            tool={tool}
+            brush={brushes[tool]}
+            hasLayer={!!present.elements.find((e) => e.id === drawLayerId)}
+            onTool={setTool}
+            onBrush={(b) => setBrushes((all) => ({ ...all, [tool]: { ...all[tool], ...b } }))}
+            onNewLayer={newDrawLayer}
+            onClear={clearDrawLayer}
+            onDone={exitDraw}
+          />
+        ) : (
+          <button
+            onClick={() => enterDraw(selected?.type === 'drawing' ? selected.id : undefined)}
+            className="absolute top-3 left-3 z-10 rounded-full border border-line bg-paper/95 px-4 py-2 text-sm shadow-sm"
+          >
+            ✎ 绘画
+          </button>
+        ))}
       {view && (
         <div className="absolute right-3 bottom-3 flex items-center divide-x divide-line rounded-full border border-line bg-paper/95 text-xs shadow-sm">
           <button onClick={() => zoomBy(1 / 1.25)} className="px-3 py-2" aria-label="缩小">−</button>
@@ -523,9 +665,20 @@ export default function Studio() {
     </p>
   )
 
+  const cutoutEditor = cutoutTarget && (
+    <CutoutEditor
+      key={cutoutTarget.elId}
+      sourceAssetId={cutoutTarget.sourceAssetId}
+      cutoutId={cutoutTarget.cutoutId}
+      onCancel={() => setCutoutFor(null)}
+      onSaved={onCutoutSaved}
+    />
+  )
+
   if (wide)
     return (
       <div className="flex h-dvh flex-col bg-paper">
+        {cutoutEditor}
         {topBar}
         {hintLine}
         <div className="flex min-h-0 flex-1">
@@ -569,6 +722,7 @@ export default function Studio() {
   const drawerTitle = drawer && ({ props: '元素属性', background: '画布背景' } as Record<string, string>)[drawer]
   return (
     <div className="flex h-dvh flex-col bg-paper">
+      {cutoutEditor}
       {topBar}
       {hintLine}
       {stage}
