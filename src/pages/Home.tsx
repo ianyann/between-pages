@@ -45,6 +45,10 @@ export default function Home() {
           </ul>
         )}
       </section>
+
+      <footer className="mt-16 pb-8 text-center">
+        <Link to="/diagnostics" className="text-xs text-mute">数据诊断</Link>
+      </footer>
     </div>
   )
 }
