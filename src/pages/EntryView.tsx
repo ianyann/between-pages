@@ -1,4 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
+import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { db, deleteEntry } from '../db'
 import { formatDate, formatTime, useAssetUrl } from '../lib'
@@ -6,6 +7,7 @@ import { formatDate, formatTime, useAssetUrl } from '../lib'
 export default function EntryView() {
   const { id = '' } = useParams()
   const navigate = useNavigate()
+  const [confirming, setConfirming] = useState(false)
   // null = 已确认不存在；undefined = 加载中
   const entry = useLiveQuery(async () => (await db.entries.get(id)) ?? null, [id])
 
@@ -18,7 +20,8 @@ export default function EntryView() {
     )
 
   async function remove() {
-    if (!confirm('删除后无法恢复，确定删除这篇记录吗？')) return
+    // 两步确认（不用 confirm()，部分内嵌浏览器环境会直接屏蔽它）
+    if (!confirming) return setConfirming(true)
     await deleteEntry(id)
     navigate('/entries', { replace: true })
   }
@@ -50,7 +53,10 @@ export default function EntryView() {
       <footer className="mt-16 space-y-1 border-t border-line pt-4 text-xs text-mute">
         <p>创建于 {formatTime(entry.createdAt)}</p>
         <p>最后修改 {formatTime(entry.updatedAt)}</p>
-        <button onClick={remove} className="mt-4 text-red-700">删除这篇记录</button>
+        <div className="mt-4 flex gap-4">
+          <button onClick={remove} className="text-red-700">{confirming ? '删除后无法恢复，再点一次确认删除' : '删除这篇记录'}</button>
+          {confirming && <button onClick={() => setConfirming(false)}>取消</button>}
+        </div>
       </footer>
     </article>
   )
