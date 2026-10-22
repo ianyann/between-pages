@@ -130,3 +130,43 @@ export function useAssetUrl(id: string | undefined): string | null | undefined {
   }, [id])
   return url
 }
+
+/** iPhone 上用系统分享面板（可「存储到文件」），其他环境直接下载。返回 false 表示用户取消。 */
+export async function shareOrDownload(file: File, title: string): Promise<boolean> {
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title })
+      return true
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') return false
+      // 分享不可用时退回下载
+    }
+  }
+  const url = URL.createObjectURL(file)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = file.name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
+  return true
+}
+
+const THUMB_EDGE = 240
+
+/** 生成素材盒缩略图：长边 240px；含透明像素时用 PNG 保留透明，否则用 JPEG。 */
+export async function makeThumb(data: ArrayBuffer, mimeType: string): Promise<{ thumb: ArrayBuffer; thumbType: string }> {
+  const img = await loadImage(new Blob([data], { type: mimeType }))
+  const k = Math.min(1, THUMB_EDGE / Math.max(img.naturalWidth, img.naturalHeight))
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(img.naturalWidth * k))
+  canvas.height = Math.max(1, Math.round(img.naturalHeight * k))
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+  const transparent = mimeType !== 'image/jpeg' && hasTransparency(ctx, canvas.width, canvas.height)
+  const type = transparent ? 'image/png' : 'image/jpeg'
+  const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, type, 0.8))
+  if (!blob) throw new Error('无法生成缩略图')
+  return { thumb: await blob.arrayBuffer(), thumbType: type }
+}

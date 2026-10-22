@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { exportBackup, getLastBackup, importBackup, setLastBackup, type BackupSummary } from '../backup'
-import { formatTime } from '../lib'
+import { formatTime, shareOrDownload } from '../lib'
 
 type Status = { kind: 'idle' | 'working' | 'done' | 'error'; text: string }
 
@@ -13,7 +13,7 @@ export default function Backup() {
     setExportStatus({ kind: 'working', text: '正在生成备份…' })
     try {
       const { file, summary } = await exportBackup()
-      const shared = await shareOrDownload(file)
+      const shared = await shareOrDownload(file, '页间备份')
       if (!shared) return setExportStatus({ kind: 'idle', text: '已取消。' })
       const now = Date.now()
       setLastBackup(now)
@@ -32,7 +32,7 @@ export default function Backup() {
       const added = await importBackup(file)
       setImportStatus({
         kind: 'done',
-        text: added.entries + added.works + added.canvases + added.assets === 0 ? '备份中的内容本机都已经有了，没有需要恢复的。' : `已恢复：${describe(added)}。`,
+        text: added.entries + added.works + added.canvases + added.boxItems + added.assets === 0 ? '备份中的内容本机都已经有了，没有需要恢复的。' : `已恢复：${describe(added)}。`,
       })
     } catch (err) {
       console.error('导入失败', err)
@@ -95,26 +95,4 @@ function StatusLine({ status }: { status: Status }) {
 
 const formatSize = (n: number) => (n < 1024 * 1024 ? `${Math.max(1, Math.round(n / 1024))} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`)
 
-const describe = (s: BackupSummary) => `${s.entries} 篇日记、${s.works} 部作品、${s.canvases} 张画布、${s.assets} 张图片`
-
-/** iPhone 上用系统分享面板（可「存储到文件」），其他环境直接下载。返回 false 表示用户取消。 */
-async function shareOrDownload(file: File): Promise<boolean> {
-  if (navigator.canShare?.({ files: [file] })) {
-    try {
-      await navigator.share({ files: [file], title: '页间备份' })
-      return true
-    } catch (err) {
-      if ((err as Error).name === 'AbortError') return false
-      // 分享不可用时退回下载
-    }
-  }
-  const url = URL.createObjectURL(file)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = file.name
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  setTimeout(() => URL.revokeObjectURL(url), 60_000)
-  return true
-}
+const describe = (s: BackupSummary) => `${s.entries} 篇日记、${s.works} 部作品、${s.canvases} 张画布、${s.boxItems} 个素材盒条目、${s.assets} 张图片`

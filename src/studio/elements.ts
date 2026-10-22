@@ -73,30 +73,43 @@ export function withMeasuredHeight(el: TextElement): TextElement {
   return { ...el, height: measureTextHeight(el) }
 }
 
-/** 新元素放置位置：大致居中，连续添加时错开，避免完全重叠。 */
-function placement(width: number, height: number, count: number) {
-  const offset = (count % 6) * 28
-  return {
-    x: Math.round((CANVAS_WIDTH - width) / 2 + offset),
-    y: Math.round(Math.max(40, (CANVAS_HEIGHT - height) / 2 - 120 + offset)),
-  }
+export interface Point {
+  x: number
+  y: number
 }
 
-export function createText(preset: TextPreset, text: string | undefined, count: number): TextElement {
+/** 默认放在纸张中上部；工作台中通常传入当前视图中心。 */
+export const PAPER_CENTER: Point = { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT / 2 - 120 }
+
+/** 新元素以 at 为中心放置，连续添加时错开，避免完全重叠。 */
+function placement(width: number, height: number, count: number, at: Point) {
+  const offset = (count % 6) * 28 - 70
+  return { x: Math.round(at.x - width / 2 + offset), y: Math.round(at.y - height / 2 + offset) }
+}
+
+export function createText(preset: TextPreset, text: string | undefined, count: number, at: Point = PAPER_CENTER): TextElement {
   const p = TEXT_PRESETS[preset]
   const base = { text: text?.trim() || p.sample, width: p.width, style: { ...p.style } }
   const height = measureTextHeight(base)
-  return { id: newId(), type: 'text', ...base, height, rotation: 0, z: count, ...placement(p.width, height, count) }
+  return { id: newId(), type: 'text', ...base, height, rotation: 0, z: count, ...placement(p.width, height, count, at) }
 }
 
 /** 默认缩放：保持原始宽高比，长边不超过画布的 60%。 */
-export function createImage(assetId: string, naturalWidth: number, naturalHeight: number, count: number): ImageElement {
+export function createImage(
+  assetId: string,
+  naturalWidth: number,
+  naturalHeight: number,
+  count: number,
+  at: Point = PAPER_CENTER,
+  exact = false, // true：正好以 at 为中心（拖放到指定位置时）
+): ImageElement {
   const nw = naturalWidth || 600
   const nh = naturalHeight || 600
   const k = Math.min(1, (CANVAS_WIDTH * 0.6) / nw, (CANVAS_HEIGHT * 0.6) / nh)
   const width = Math.round(nw * k)
   const height = Math.round(nh * k)
-  return { id: newId(), type: 'image', assetId, width, height, rotation: 0, z: count, style: { opacity: 1 }, ...placement(width, height, count) }
+  const pos = exact ? { x: Math.round(at.x - width / 2), y: Math.round(at.y - height / 2) } : placement(width, height, count, at)
+  return { id: newId(), type: 'image', assetId, width, height, rotation: 0, z: count, style: { opacity: 1 }, ...pos }
 }
 
 const renumber = (els: CanvasElement[]) => els.map((el, i) => (el.z === i ? el : { ...el, z: i }))
@@ -115,6 +128,11 @@ export function moveLayer(els: CanvasElement[], id: string, move: LayerMove): Ca
 
 export function addElement(els: CanvasElement[], el: CanvasElement): CanvasElement[] {
   return renumber([...els, el])
+}
+
+/** 复制：新的元素 ID，共用同一素材，略微错开并放在最上层。 */
+export function duplicateElement(el: CanvasElement): CanvasElement {
+  return { ...el, id: newId(), x: el.x + 24, y: el.y + 24 }
 }
 
 export function removeElement(els: CanvasElement[], id: string): CanvasElement[] {

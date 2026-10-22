@@ -1,52 +1,57 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { db, type CanvasElement, type Entry, type ImageElement, type TextElement, type TextPreset, type TextStyle } from '../db'
+import {
+  BOX_CATEGORIES,
+  db,
+  type BoxCategory,
+  type BoxItem,
+  type CanvasElement,
+  type Entry,
+  type ImageElement,
+  type TextElement,
+  type TextPreset,
+  type TextStyle,
+} from '../db'
 import { useAssetUrl } from '../lib'
+import { ASSET_DRAG_TYPE } from './CanvasStage'
+import { decorationAssetId, decorationPreview, DECORATION_GROUPS, DECORATIONS } from './decorations'
 import { BACKGROUND_SWATCHES, COLOR_SWATCHES, TEXT_PRESETS, type LayerMove } from './elements'
 
-export type AddTab = 'image' | 'text' | 'material'
+export type AddTab = 'box' | 'deco' | 'text' | 'material'
 
 export const ADD_TABS: { value: AddTab; label: string }[] = [
-  { value: 'image', label: '图片' },
+  { value: 'box', label: '素材盒' },
+  { value: 'deco', label: '装饰' },
   { value: 'text', label: '文字' },
-  { value: 'material', label: '草稿素材' },
+  { value: 'material', label: '日记素材' },
 ]
 
 const sectionTitle = 'mb-3 text-xs tracking-[0.2em] text-mute'
 const chip = 'rounded-full border border-line px-3 py-1 text-sm hover:border-ink'
+
+/** 桌面端可把缩略图直接拖到工作台上（手机上点按添加）。 */
+const dragProps = (assetId: string) => ({
+  draggable: true,
+  onDragStart: (e: React.DragEvent) => {
+    e.dataTransfer.setData(ASSET_DRAG_TYPE, assetId)
+    e.dataTransfer.effectAllowed = 'copy'
+  },
+})
 
 // —— 左侧：添加素材 ——
 
 interface AddProps {
   tab: AddTab
   entry: Entry
-  uploading: boolean
+  importing: number
   onAddImage: (assetId: string) => void
-  onUpload: (files: FileList) => void
+  onImport: (files: FileList, category: BoxCategory) => void
   onAddText: (preset: TextPreset, text?: string) => void
 }
 
-export function AddPanel({ tab, entry, uploading, onAddImage, onUpload, onAddText }: AddProps) {
-  if (tab === 'image')
-    return (
-      <div className="space-y-6">
-        <label className="flex cursor-pointer items-center justify-center border border-dashed border-mute/60 py-4 text-sm text-mute">
-          {uploading ? '正在处理图片…' : '+ 从本地添加图片'}
-          <input
-            id="studio-upload"
-            type="file"
-            accept="image/*"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              if (e.target.files?.length) onUpload(e.target.files)
-              e.target.value = ''
-            }}
-          />
-        </label>
-        <EntryImages entry={entry} onAddImage={onAddImage} />
-      </div>
-    )
+export function AddPanel({ tab, entry, importing, onAddImage, onImport, onAddText }: AddProps) {
+  if (tab === 'box') return <BoxPanel importing={importing} onAddImage={onAddImage} onImport={onImport} />
+  if (tab === 'deco') return <DecorationPanel onAddImage={onAddImage} />
 
   if (tab === 'text')
     return (
@@ -74,6 +79,131 @@ export function AddPanel({ tab, entry, uploading, onAddImage, onUpload, onAddTex
   return <Materials entry={entry} onAddImage={onAddImage} onAddText={onAddText} />
 }
 
+/** 素材盒：跨日记复用的图片收藏。缩略图来自 boxItems，不加载原图。 */
+function BoxPanel({ importing, onAddImage, onImport }: Pick<AddProps, 'importing' | 'onAddImage' | 'onImport'>) {
+  const items = useLiveQuery(() => db.boxItems.orderBy('addedAt').reverse().toArray(), [])
+  const [filter, setFilter] = useState<BoxCategory | 'all'>('all')
+  const [importCategory, setImportCategory] = useState<BoxCategory>('其他')
+  const [query, setQuery] = useState('')
+  const q = query.trim().toLowerCase()
+  const shown = items?.filter((it) => (filter === 'all' || it.category === filter) && it.name.toLowerCase().includes(q))
+
+  return (
+    <div className="space-y-5">
+      <div className="border border-dashed border-mute/60 p-3">
+        <div role="group" aria-label="导入到分类" className="mb-2 flex flex-wrap items-center gap-1.5 text-xs">
+          <span className="text-mute">放入</span>
+          {BOX_CATEGORIES.map((c) => (
+            <button
+              key={c}
+              onClick={() => setImportCategory(c)}
+              className={`rounded-full border px-2 py-0.5 ${importCategory === c ? 'border-ink bg-ink text-paper' : 'border-line'}`}
+            >
+              {c}
+            </button>
+          ))}
+        </div>
+        <label className="flex cursor-pointer items-center justify-center py-2 text-sm">
+          {importing > 0 ? `正在导入 ${importing} 张…` : '+ 一次导入多张图片'}
+          <input
+            id="box-import"
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files?.length) onImport(e.target.files, importCategory)
+              e.target.value = ''
+            }}
+          />
+        </label>
+        <p className="text-center text-[11px] text-mute">JPG / PNG / WebP，透明 PNG 保留透明</p>
+      </div>
+
+      <div className="space-y-2">
+        <input
+          id="box-search"
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="按文件名搜索"
+          className="w-full border-b border-line bg-transparent py-1 outline-none placeholder:text-mute/60 focus:border-ink"
+        />
+        <div role="group" aria-label="按分类筛选" className="flex flex-wrap gap-1.5 text-xs">
+          {(['all', ...BOX_CATEGORIES] as const).map((c) => (
+            <button
+              key={c}
+              onClick={() => setFilter(c)}
+              className={`rounded-full border px-2.5 py-0.5 ${filter === c ? 'border-ink bg-ink text-paper' : 'border-line text-mute'}`}
+            >
+              {c === 'all' ? '全部' : c}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {shown === undefined ? null : items!.length === 0 ? (
+        <p className="text-sm leading-relaxed text-mute">素材盒还是空的。导入的图片可以在任何一篇日记的工作台里重复使用。</p>
+      ) : shown.length === 0 ? (
+        <p className="text-sm text-mute">没有符合条件的素材。</p>
+      ) : (
+        <div className="grid grid-cols-3 gap-2">
+          {shown.map((it) => (
+            <BoxThumb key={it.id} item={it} onClick={() => onAddImage(it.id)} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function BoxThumb({ item, onClick }: { item: BoxItem; onClick: () => void }) {
+  // 在同一个 effect 里创建并释放临时 URL，避免被提前释放
+  const [url, setUrl] = useState<string>()
+  useEffect(() => {
+    const u = URL.createObjectURL(new Blob([item.thumb], { type: item.thumbType }))
+    setUrl(u)
+    return () => URL.revokeObjectURL(u)
+  }, [item.thumb, item.thumbType])
+  return (
+    <button
+      {...dragProps(item.id)}
+      onClick={onClick}
+      title={item.name}
+      aria-label={`添加素材 ${item.name}`}
+      className="checker aspect-square overflow-hidden border border-line"
+    >
+      {url && <img src={url} alt="" draggable={false} className="h-full w-full object-contain" />}
+    </button>
+  )
+}
+
+function DecorationPanel({ onAddImage }: { onAddImage: (assetId: string) => void }) {
+  return (
+    <div className="space-y-6">
+      {DECORATION_GROUPS.map((g) => (
+        <div key={g}>
+          <p className={sectionTitle}>{g}</p>
+          <div className="grid grid-cols-2 gap-2">
+            {DECORATIONS.filter((d) => d.group === g).map((d) => (
+              <button
+                key={d.key}
+                {...dragProps(decorationAssetId(d.key))}
+                onClick={() => onAddImage(decorationAssetId(d.key))}
+                aria-label={`添加装饰 ${d.label}`}
+                className="checker flex h-20 items-center justify-center overflow-hidden border border-line p-2"
+              >
+                <img src={decorationPreview(d)} alt="" draggable={false} className="max-h-full max-w-full" />
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+      <p className="text-xs leading-relaxed text-mute">装饰和图片一样可以叠放、旋转、缩放，并在属性中调整透明度。</p>
+    </div>
+  )
+}
+
 function EntryImages({ entry, onAddImage }: { entry: Entry; onAddImage: (id: string) => void }) {
   return (
     <div>
@@ -94,14 +224,14 @@ function EntryImages({ entry, onAddImage }: { entry: Entry; onAddImage: (id: str
 function Thumb({ assetId, onClick }: { assetId: string; onClick: () => void }) {
   const url = useAssetUrl(assetId)
   return (
-    <button onClick={onClick} className="aspect-square overflow-hidden bg-line" aria-label="把这张图片放进画布">
+    <button {...dragProps(assetId)} onClick={onClick} className="aspect-square overflow-hidden bg-line" aria-label="把这张图片放进画布">
       {url && <img src={url} alt="" className="h-full w-full object-contain" />}
     </button>
   )
 }
 
 /** 草稿素材：日记标题、正文、图片与关联作品。放入画布的是副本，修改不会影响日记本身。 */
-function Materials({ entry, onAddImage, onAddText }: Omit<AddProps, 'tab' | 'uploading' | 'onUpload'>) {
+function Materials({ entry, onAddImage, onAddText }: Pick<AddProps, 'entry' | 'onAddImage' | 'onAddText'>) {
   const works = useLiveQuery(async () => (await db.works.bulkGet(entry.workIds)).filter((w) => w !== undefined), [entry.workIds.join()])
   const paragraphs = entry.body.split(/\n+/).map((p) => p.trim()).filter(Boolean)
 

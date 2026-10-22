@@ -2,32 +2,40 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import {
+  addToBox,
   CANVAS_HEIGHT,
   CANVAS_WIDTH,
+  DESK,
   cleanupEntryAssets,
   db,
   loadCanvas,
   newCanvasId,
   saveCanvas,
+  type BoxCategory,
   type CanvasElement,
   type TextElement,
   type TextPreset,
 } from '../db'
-import { fileToAsset, formatClock } from '../lib'
-import CanvasStage from './CanvasStage'
+import { fileToAsset, formatClock, makeThumb, shareOrDownload, today } from '../lib'
+import { ensureDecorationAsset, findDecoration } from './decorations'
+import CanvasStage, { clampView, MAX_ZOOM, MIN_ZOOM, type View } from './CanvasStage'
+import { exportPaperPng } from './exportPng'
 import {
   addElement,
   createImage,
   createText,
+  duplicateElement,
   moveLayer,
   patchElement,
   removeElement,
   type LayerMove,
+  type Point,
   type StudioDoc,
 } from './elements'
 import { ADD_TABS, AddPanel, BackgroundPanel, PropsPanel, type AddTab } from './Panels'
 
 const AUTOSAVE_DELAY = 1000
+const BOX_TYPES = ['image/jpeg', 'image/png', 'image/webp']
 const HISTORY_LIMIT = 100
 const EMPTY: StudioDoc = { background: '#F7F6F2', elements: [] }
 
@@ -43,9 +51,10 @@ export default function Studio() {
   const [present, setPresent] = useState<StudioDoc>(EMPTY)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [addTab, setAddTab] = useState<AddTab>('material')
+  const [addTab, setAddTab] = useState<AddTab>('box')
+  const [leftOpen, setLeftOpen] = useState(true)
   const [drawer, setDrawer] = useState<Drawer>(null)
-  const [uploading, setUploading] = useState(0)
+  const [importing, setImporting] = useState(0)
   const [hint, setHint] = useState('')
 
   // —— 撤销 / 重做：保存整份快照；预览中的变化（拖滑块等）结束时才记一步 ——
@@ -200,6 +209,7 @@ export default function Studio() {
     let job = imageJobs.current.get(assetId)
     if (!job) {
       job = (async () => {
+        await ensureDecorationAsset(assetId).catch((err) => console.warn('生成装饰失败', err))
         const asset = await db.assets.get(assetId)
         if (!asset) return null
         const url = URL.createObjectURL(new Blob([asset.data], { type: asset.mimeType }))
@@ -233,30 +243,58 @@ export default function Studio() {
     if (!wide) setDrawer(null)
   }
 
-  async function addImage(assetId: string) {
+  /** at 省略时放在当前视图中心；exact 为 true 时正好以 at 为中心（拖放）。 */
+  async function addImage(assetId: string, at?: Point, exact = false) {
     const img = await ensureImage(assetId)
     if (!img) return setHint('这张图片无法读取。')
-    add(createImage(assetId, img.naturalWidth, img.naturalHeight, presentRef.current.elements.length))
+    const deco = findDecoration(assetId) // 装饰按设计尺寸放置（素材本身是 2 倍分辨率）
+    const [w, h] = deco ? [deco.width, deco.height] : [img.naturalWidth, img.naturalHeight]
+    add(createImage(assetId, w, h, presentRef.current.elements.length, at ?? viewCenter(), exact))
   }
 
-  async function upload(files: FileList) {
-    const list = Array.from(files)
-    setUploading((n) => n + list.length)
-    for (const file of list) {
-      try {
-        const asset = await fileToAsset(file, { entryId: id })
-        await db.assets.put(asset) // 只被画布引用，不加入日记图片
-        await addImage(asset.id)
-      } catch (err) {
-        console.error('添加图片失败', err)
-        setHint(`无法添加图片：${file.name}`)
-      } finally {
-        setUploading((n) => n - 1)
-      }
+  function duplicate(elId: string) {
+    const el = presentRef.current.elements.find((e) => e.id === elId)
+    if (el) add(duplicateElement(el))
+  }
+
+  const [exporting, setExporting] = useState(false)
+  async function exportPng() {
+    setExporting(true)
+    try {
+      const { blob, missing } = await exportPaperPng(presentRef.current, ensureImage)
+      const name = `页间-${(entry?.title || '无标题').replace(/[\\/:*?"<>|《》]/g, '')}-${today()}.png`
+      await shareOrDownload(new File([blob], name, { type: 'image/png' }), '页间拼贴')
+      if (missing) setHint(`有 ${missing} 张图片无法读取，导出时已略过。`)
+    } catch (err) {
+      console.error('导出失败', err)
+      setHint('导出图片失败，请重试。')
+    } finally {
+      setExporting(false)
     }
   }
 
-  const addText = (preset: TextPreset, text?: string) => add(createText(preset, text, presentRef.current.elements.length))
+  /** 导入素材盒：一次多张，逐张处理（避免手机内存吃紧）；失败的单独提示，不影响其他图片。 */
+  async function importToBox(files: FileList, category: BoxCategory) {
+    const list = Array.from(files)
+    const failed: string[] = []
+    setImporting((n) => n + list.length)
+    for (const file of list) {
+      try {
+        if (!BOX_TYPES.includes(file.type)) throw new Error('不支持的格式')
+        const asset = await fileToAsset(file, {})
+        const { thumb, thumbType } = await makeThumb(asset.data, asset.mimeType)
+        await addToBox(asset, { id: asset.id, category, name: file.name, width: asset.width, height: asset.height, thumb, thumbType, addedAt: Date.now() })
+      } catch (err) {
+        console.error('导入素材失败', file.name, err)
+        failed.push(file.name)
+      } finally {
+        setImporting((n) => n - 1)
+      }
+    }
+    if (failed.length) setHint(`${failed.length} 张图片未能导入（只支持 JPG、PNG、WebP）：${failed.join('、')}`)
+  }
+
+  const addText = (preset: TextPreset, text?: string) => add(createText(preset, text, presentRef.current.elements.length, viewCenter()))
 
   const patch = useCallback(
     (elId: string, p: Partial<CanvasElement>, mode: 'preview' | 'commit' = 'commit') =>
@@ -319,19 +357,62 @@ export default function Studio() {
     return () => window.removeEventListener('keydown', onKey)
   }, [undo, redo, remove, patch, selected, selectedId])
 
-  // —— 画布显示尺寸：按容器大小缩放，数据始终是逻辑坐标 ——
+  // —— 视图：容器尺寸 + 缩放平移。只影响显示；窗口变化时保持画面中心不动，元素数据不变 ——
   const [box, setBox] = useState<HTMLDivElement | null>(null)
-  const [scale, setScale] = useState(0.5)
+  const [size, setSize] = useState({ w: 0, h: 0 })
+  const [view, setView] = useState<View | null>(null)
+  const sizeRef = useRef(size)
   useEffect(() => {
     if (!box) return
     const ro = new ResizeObserver(([e]) => {
-      const pad = wide ? 48 : 24
-      const s = Math.min((e.contentRect.width - pad) / CANVAS_WIDTH, (e.contentRect.height - pad) / CANVAS_HEIGHT)
-      setScale(Math.max(0.1, s))
+      const w = Math.round(e.contentRect.width)
+      const h = Math.round(e.contentRect.height)
+      const prev = sizeRef.current
+      if (w === prev.w && h === prev.h) return
+      sizeRef.current = { w, h }
+      setView((v) => v && { ...v, x: v.x + (w - prev.w) / 2, y: v.y + (h - prev.h) / 2 })
+      setSize({ w, h })
     })
     ro.observe(box)
     return () => ro.disconnect()
-  }, [box, wide])
+  }, [box])
+
+  const fitRect = useCallback((r: { x: number; y: number; width: number; height: number }, pad: number): View => {
+    const { w, h } = sizeRef.current
+    const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min((w - pad * 2) / r.width, (h - pad * 2) / r.height)))
+    return { zoom, x: (w - r.width * zoom) / 2 - r.x * zoom, y: (h - r.height * zoom) / 2 - r.y * zoom }
+  }, [])
+  const fitPaper = useCallback(() => setView(fitRect({ x: 0, y: 0, width: CANVAS_WIDTH, height: CANVAS_HEIGHT }, wide ? 32 : 12)), [fitRect, wide])
+  function fitDesk() {
+    // 整个桌面，以及万一在桌面外的元素
+    let [x0, y0, x1, y1] = [DESK.x, DESK.y, DESK.x + DESK.width, DESK.y + DESK.height]
+    for (const el of presentRef.current.elements) {
+      const r = Math.hypot(el.width, el.height)
+      ;[x0, y0, x1, y1] = [Math.min(x0, el.x - r), Math.min(y0, el.y - r), Math.max(x1, el.x + r), Math.max(y1, el.y + r)]
+    }
+    setView(fitRect({ x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, 12))
+  }
+  function zoomBy(k: number) {
+    setView((v) => {
+      if (!v) return v
+      const { w, h } = sizeRef.current
+      const zoom = v.zoom * k
+      const cx = (w / 2 - v.x) / v.zoom
+      const cy = (h / 2 - v.y) / v.zoom
+      return clampView({ zoom, x: w / 2 - cx * zoom, y: h / 2 - cy * zoom }, w, h)
+    })
+  }
+  /** 当前视图中心对应的世界坐标：新元素放在用户正在看的位置。 */
+  function viewCenter(): Point {
+    const { w, h } = sizeRef.current
+    if (!view || !w) return { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT / 2 - 120 }
+    return { x: (w / 2 - view.x) / view.zoom, y: (h / 2 - view.y) / view.zoom }
+  }
+
+  // 首次打开：适应纸张
+  useEffect(() => {
+    if (loaded && size.w > 0 && !view) fitPaper()
+  }, [loaded, size, view, fitPaper])
 
   if (entry === null)
     return (
@@ -348,7 +429,7 @@ export default function Studio() {
   })()
 
   const addPanel = (tab: AddTab) => (
-    <AddPanel tab={tab} entry={entry} uploading={uploading > 0} onAddImage={addImage} onUpload={upload} onAddText={addText} />
+    <AddPanel tab={tab} entry={entry} importing={importing} onAddImage={(assetId) => addImage(assetId)} onImport={importToBox} onAddText={addText} />
   )
   const propsPanel = selected && (
     <PropsPanel
@@ -374,11 +455,18 @@ export default function Studio() {
   )
 
   const stage = (
-    <div ref={setBox} className="flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden bg-[#ECEAE4]">
-      <div className="shadow-[0_1px_12px_rgba(55,55,53,0.12)]">
+    <div ref={setBox} className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-[#E6E2D9]">
+      {view && size.w > 0 && (
         <CanvasStage
           doc={present}
-          scale={scale}
+          width={size.w}
+          height={size.h}
+          view={view}
+          onViewChange={setView}
+          onDuplicate={duplicate}
+          onLayer={layer}
+          onDelete={remove}
+          onDropAsset={(assetId, at) => addImage(assetId, at, true)}
           images={images}
           selectedId={selectedId}
           editingId={editingId}
@@ -394,7 +482,16 @@ export default function Studio() {
           onPreview={(elId, p) => patch(elId, p, 'preview')}
           onCommit={(elId, p) => patch(elId, p)}
         />
-      </div>
+      )}
+      {view && (
+        <div className="absolute right-3 bottom-3 flex items-center divide-x divide-line rounded-full border border-line bg-paper/95 text-xs shadow-sm">
+          <button onClick={() => zoomBy(1 / 1.25)} className="px-3 py-2" aria-label="缩小">−</button>
+          <span className="w-12 py-2 text-center tabular-nums text-mute">{Math.round(view.zoom * 100)}%</span>
+          <button onClick={() => zoomBy(1.25)} className="px-3 py-2" aria-label="放大">+</button>
+          <button onClick={fitPaper} className="px-3 py-2">适应纸张</button>
+          <button onClick={fitDesk} className="px-3 py-2">整个工作台</button>
+        </div>
+      )}
     </div>
   )
 
@@ -406,6 +503,9 @@ export default function Studio() {
         {wide && <span className="ml-2 text-xs tracking-[0.2em] text-mute uppercase">Studio · {entry.title || '无标题'}</span>}
       </div>
       <SaveIndicator state={saveState} dirty={dirty} updatedAt={updatedAt} onRetry={save} />
+      <button onClick={exportPng} disabled={exporting} className="shrink-0 rounded-full border border-line px-3 py-1 text-xs disabled:opacity-40">
+        {exporting ? '导出中…' : '导出 PNG'}
+      </button>
       <div className="flex gap-1">
         <IconButton label="撤销" disabled={!past.current.length && !previewBase.current} onClick={undo}>
           <ArrowIcon />
@@ -429,7 +529,12 @@ export default function Studio() {
         {topBar}
         {hintLine}
         <div className="flex min-h-0 flex-1">
-          <aside className="flex w-72 shrink-0 flex-col border-r border-line">
+          {!leftOpen && (
+            <button onClick={() => setLeftOpen(true)} className="w-9 shrink-0 border-r border-line text-xs text-mute [writing-mode:vertical-rl]">
+              展开素材盒 ›
+            </button>
+          )}
+          <aside className={`${leftOpen ? 'flex' : 'hidden'} w-72 shrink-0 flex-col border-r border-line`}>
             <nav className="flex border-b border-line text-sm">
               {ADD_TABS.map((t) => (
                 <button
@@ -440,6 +545,7 @@ export default function Studio() {
                   {t.label}
                 </button>
               ))}
+              <button onClick={() => setLeftOpen(false)} className="px-2.5 text-mute" aria-label="收起面板" title="收起面板">‹</button>
             </nav>
             <div className="min-h-0 flex-1 overflow-y-auto p-4">{addPanel(addTab)}</div>
             <p className="border-t border-line p-3 text-[11px] leading-relaxed text-mute">
@@ -478,14 +584,11 @@ export default function Studio() {
       <nav className="flex shrink-0 border-t border-line bg-paper pb-[env(safe-area-inset-bottom)] text-sm">
         {ADD_TABS.map((t) => (
           <ToolButton key={t.value} on={drawer === t.value} onClick={() => setDrawer(drawer === t.value ? null : t.value)}>
-            {t.label === '草稿素材' ? '素材' : t.label}
+            {t.label === '日记素材' ? '日记' : t.label}
           </ToolButton>
         ))}
         {selected ? (
-          <>
-            <ToolButton on={drawer === 'props'} onClick={() => setDrawer(drawer === 'props' ? null : 'props')}>属性</ToolButton>
-            <ToolButton on={false} onClick={() => remove(selected.id)} danger>删除</ToolButton>
-          </>
+          <ToolButton on={drawer === 'props'} onClick={() => setDrawer(drawer === 'props' ? null : 'props')}>属性</ToolButton>
         ) : (
           <ToolButton on={drawer === 'background'} onClick={() => setDrawer(drawer === 'background' ? null : 'background')}>背景</ToolButton>
         )}

@@ -25,3 +25,10 @@ body {
     font-size: 16px;
   }
 }
+
+/* 透明素材的棋盘格底，便于看出透明区域 */
+.checker {
+  background-color: #fff;
+  background-image: conic-gradient(#ece9e2 25%, transparent 0 50%, #ece9e2 0 75%, transparent 0);
+  background-size: 12px 12px;
+}

@@ -9,8 +9,9 @@ import Dexie, { type EntityTable, type Transaction } from 'dexie'
  * v1 第一阶段：entries、assets
  * v2 第二阶段：新增 works；entries 增加 *workIds、*imageIds 多值索引
  * v3 第三阶段：新增 canvases（创作桌画布）；旧的 Entry.canvas 字段迁入该表
+ * v3.5 新增 boxItems（素材盒）；画布元素允许位于纸张外的桌面区域（坐标系不变）
  */
-export const DB_VERSION = 3
+export const DB_VERSION = 4
 
 export type EntryStatus = 'draft' | 'done'
 
@@ -29,9 +30,14 @@ export interface Entry {
   canvas: unknown | null
 }
 
-/** 画布逻辑尺寸。元素坐标始终使用这套尺寸，与屏幕显示大小无关。 */
+/**
+ * 坐标约定（世界坐标，保存到数据库）：
+ * 纸张固定在 (0, 0)–(CANVAS_WIDTH, CANVAS_HEIGHT)；桌面是包围纸张的更大区域 DESK。
+ * 元素可以位于纸张外（坐标为负或超出纸张），与屏幕缩放、平移无关。导出只取纸张范围。
+ */
 export const CANVAS_WIDTH = 900
 export const CANVAS_HEIGHT = 1200
+export const DESK = { x: -700, y: -500, width: 2300, height: 2200 }
 export const CANVAS_FORMAT = 1
 
 /** 一篇日记的创作桌画布。 */
@@ -85,6 +91,21 @@ export interface TextElement extends BaseElement {
 
 export type CanvasElement = ImageElement | TextElement
 
+export const BOX_CATEGORIES = ['人物', '场景', '物件', '截图', '其他'] as const
+export type BoxCategory = (typeof BOX_CATEGORIES)[number]
+
+/** 素材盒条目：只存索引信息与缩略图，原图仍在 assets 表（id 相同）。可被任意日记复用。 */
+export interface BoxItem {
+  id: string // = assetId
+  category: BoxCategory
+  name: string
+  width: number
+  height: number
+  thumb: ArrayBuffer // 长边约 240px 的缩略图
+  thumbType: string
+  addedAt: number
+}
+
 export type WorkType = 'manga' | 'novel' | 'film' | 'tv' | 'other'
 
 export const WORK_TYPES: { value: WorkType; label: string }[] = [
@@ -128,6 +149,7 @@ export const db = new Dexie('between-pages') as Dexie & {
   assets: EntityTable<Asset, 'id'>
   works: EntityTable<Work, 'id'>
   canvases: EntityTable<CanvasDoc, 'id'>
+  boxItems: EntityTable<BoxItem, 'id'>
 }
 
 db.version(1).stores({
@@ -164,6 +186,15 @@ db.version(3)
     }
   })
 
+// v4 只新增素材盒表，不改动任何已有数据
+db.version(4).stores({
+  entries: 'id, entryDate, updatedAt, status, *workIds, *imageIds',
+  assets: 'id, entryId',
+  works: 'id, type, name, updatedAt, coverAssetId',
+  canvases: 'id, entryId, updatedAt, *assetIds',
+  boxItems: 'id, category, addedAt',
+})
+
 /** 为旧版本日记补全缺失字段（数据库迁移与导入备份共用）。只补缺失项，不改 ID、不动其他内容。 */
 export function fillEntryDefaults(e: Partial<Entry>) {
   if (!Array.isArray(e.workIds)) e.workIds = []
@@ -189,10 +220,10 @@ export async function listEntries(limit?: number): Promise<Entry[]> {
 }
 
 /** 涉及素材增删的事务都需要这些表，以便检查全部引用。 */
-const ASSET_TABLES = () => [db.entries, db.assets, db.works, db.canvases]
+const ASSET_TABLES = () => [db.entries, db.assets, db.works, db.canvases, db.boxItems]
 
 /**
- * 删除不再被任何日记、作品或画布引用的素材。必须在包含 entries、works、assets 的读写事务中调用，
+ * 删除不再被任何日记、作品、画布或素材盒引用的素材。必须在包含 entries、works、assets 的读写事务中调用，
  * 且调用前先写入引用变化。
  */
 async function deleteUnreferencedAssets(ids: Iterable<string>) {
@@ -200,7 +231,8 @@ async function deleteUnreferencedAssets(ids: Iterable<string>) {
     const usedByEntry = await db.entries.where('imageIds').equals(id).count()
     const usedByWork = await db.works.where('coverAssetId').equals(id).count()
     const usedByCanvas = await db.canvases.where('assetIds').equals(id).count()
-    if (!usedByEntry && !usedByWork && !usedByCanvas) await db.assets.delete(id)
+    const inBox = await db.boxItems.get(id)
+    if (!usedByEntry && !usedByWork && !usedByCanvas && !inBox) await db.assets.delete(id)
   }
 }
 
@@ -222,6 +254,14 @@ export async function deleteEntry(id: string) {
     await db.canvases.bulkDelete(canvases.map((c) => c.id))
     await db.entries.delete(id)
     await deleteUnreferencedAssets([...(entry?.imageIds ?? []), ...ownKeys, ...canvases.flatMap((c) => c.assetIds)])
+  })
+}
+
+/** 把图片放进素材盒（原图与条目同一事务写入）。 */
+export async function addToBox(asset: Asset, item: BoxItem) {
+  await db.transaction('rw', [db.assets, db.boxItems], async () => {
+    await db.assets.put(asset)
+    await db.boxItems.put(item)
   })
 }
 
