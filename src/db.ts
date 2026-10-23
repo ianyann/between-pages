@@ -11,8 +11,9 @@ import Dexie, { type EntityTable, type Transaction } from 'dexie'
  * v3 第三阶段：新增 canvases（创作桌画布）；旧的 Entry.canvas 字段迁入该表
  * v3.5 新增 boxItems（素材盒）；画布元素允许位于纸张外的桌面区域（坐标系不变）
  * v5 新增 cutouts（剪裁素材的遮罩与来源）；画布新增 drawing（绘画层）元素类型
+ * v6 新增 proEdits（专业编辑器实验：结果 PNG、来源与可选 PSD 的关联）
  */
-export const DB_VERSION = 5
+export const DB_VERSION = 6
 
 export type EntryStatus = 'draft' | 'done'
 
@@ -114,7 +115,7 @@ export interface DrawingElement extends BaseElement {
 
 export type CanvasElement = ImageElement | TextElement | DrawingElement
 
-export const BOX_CATEGORIES = ['人物', '场景', '物件', '截图', '剪裁', '其他'] as const
+export const BOX_CATEGORIES = ['人物', '场景', '物件', '截图', '剪裁', '专业编辑', '其他'] as const
 export type BoxCategory = (typeof BOX_CATEGORIES)[number]
 
 /** 素材盒条目：只存索引信息与缩略图，原图仍在 assets 表（id 相同）。可被任意日记复用。 */
@@ -191,6 +192,7 @@ export const db = new Dexie('between-pages') as Dexie & {
   canvases: EntityTable<CanvasDoc, 'id'>
   boxItems: EntityTable<BoxItem, 'id'>
   cutouts: EntityTable<Cutout, 'id'>
+  proEdits: EntityTable<ProEdit, 'id'>
 }
 
 db.version(1).stores({
@@ -246,6 +248,17 @@ db.version(5).stores({
   cutouts: 'id, sourceAssetId, updatedAt',
 })
 
+// v6 只新增专业编辑记录表，不改动任何已有数据
+db.version(6).stores({
+  entries: 'id, entryDate, updatedAt, status, *workIds, *imageIds',
+  assets: 'id, entryId',
+  works: 'id, type, name, updatedAt, coverAssetId',
+  canvases: 'id, entryId, updatedAt, *assetIds',
+  boxItems: 'id, category, addedAt',
+  cutouts: 'id, sourceAssetId, updatedAt',
+  proEdits: 'id, sourceAssetId, psdAssetId, updatedAt',
+})
+
 /** 为旧版本日记补全缺失字段（数据库迁移与导入备份共用）。只补缺失项，不改 ID、不动其他内容。 */
 export function fillEntryDefaults(e: Partial<Entry>) {
   if (!Array.isArray(e.workIds)) e.workIds = []
@@ -271,22 +284,32 @@ export async function listEntries(limit?: number): Promise<Entry[]> {
 }
 
 /** 涉及素材增删的事务都需要这些表，以便检查全部引用。 */
-const ASSET_TABLES = () => [db.entries, db.assets, db.works, db.canvases, db.boxItems, db.cutouts]
+const ASSET_TABLES = () => [db.entries, db.assets, db.works, db.canvases, db.boxItems, db.cutouts, db.proEdits]
 
 /**
  * 删除不再被任何日记、作品、画布、素材盒或剪裁来源引用的素材。必须在包含 entries、works、assets 的读写事务中调用，
  * 且调用前先写入引用变化。
  */
 async function deleteUnreferencedAssets(ids: Iterable<string>) {
-  for (const id of new Set(ids)) {
+  const queue = [...new Set(ids)]
+  while (queue.length) {
+    const id = queue.shift()!
     const usedByEntry = await db.entries.where('imageIds').equals(id).count()
     const usedByWork = await db.works.where('coverAssetId').equals(id).count()
     const usedByCanvas = await db.canvases.where('assetIds').equals(id).count()
     const inBox = await db.boxItems.get(id)
     const usedAsCutoutSource = await db.cutouts.where('sourceAssetId').equals(id).count() // 剪裁结果需要原图才能再编辑
-    if (!usedByEntry && !usedByWork && !usedByCanvas && !inBox && !usedAsCutoutSource) {
+    const usedByProEdit =
+      (await db.proEdits.where('sourceAssetId').equals(id).count()) + (await db.proEdits.where('psdAssetId').equals(id).count())
+    if (!usedByEntry && !usedByWork && !usedByCanvas && !inBox && !usedAsCutoutSource && !usedByProEdit) {
       await db.assets.delete(id)
       await db.cutouts.delete(id) // 若它本身是剪裁结果，一并删除其遮罩记录（原图不受影响）
+      // 若它是专业编辑的结果：删除关联记录，其专属 PSD 随后按同样规则检查；来源图不连带删除
+      const pro = await db.proEdits.get(id)
+      if (pro) {
+        await db.proEdits.delete(id)
+        if (pro.psdAssetId) queue.push(pro.psdAssetId)
+      }
     }
   }
 }
@@ -316,6 +339,32 @@ export async function deleteEntry(id: string) {
 export async function addToBox(asset: Asset, item: BoxItem) {
   await db.transaction('rw', [db.assets, db.boxItems], async () => {
     await db.assets.put(asset)
+    await db.boxItems.put(item)
+  })
+}
+
+/**
+ * 专业编辑器（Photopea 实验）的保存记录：
+ * id 为保存到素材盒的透明 PNG 结果；psdAssetId 指向同时保存的 PSD（保留图层与蒙版，不作为图片显示）。
+ * 来源图与 PSD 都不会因为删除结果而连带删除来源图。
+ */
+export interface ProEdit {
+  id: string // = 结果 PNG 的素材 ID
+  sourceAssetId: string // 打开编辑器时的素材（原图或上一次的结果），从不被覆盖
+  psdAssetId: string | null
+  editor: 'photopea'
+  createdAt: number
+  updatedAt: number
+}
+
+export const PSD_MIME = 'image/vnd.adobe.photoshop'
+
+/** 保存专业编辑结果：PNG、可选 PSD、关联记录、素材盒条目在同一事务中写入。 */
+export async function saveProEdit(png: Asset, psd: Asset | null, record: ProEdit, item: BoxItem) {
+  await db.transaction('rw', [db.assets, db.proEdits, db.boxItems], async () => {
+    await db.assets.put(png)
+    if (psd) await db.assets.put(psd)
+    await db.proEdits.put(record)
     await db.boxItems.put(item)
   })
 }

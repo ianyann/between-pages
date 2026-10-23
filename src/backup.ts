@@ -1,9 +1,10 @@
-import { BOX_CATEGORIES, db, DB_VERSION, fillEntryDefaults, normalizeCanvas, WORK_TYPES, type Asset, type BoxItem, type CanvasDoc, type Cutout, type Entry, type Work } from './db'
+import { BOX_CATEGORIES, db, DB_VERSION, fillEntryDefaults, normalizeCanvas, WORK_TYPES, type Asset, type BoxItem, type CanvasDoc, type Cutout, type ProEdit, type Entry, type Work } from './db'
 
 /**
  * 备份文件格式（JSON）：
  * { app, format, dbVersion, exportedAt, entries, works, canvases, boxItems, assets }
- * works（v2 起）、canvases（v3 起）、boxItems（v4 起）、cutouts（v5 起）为可选，旧备份没有这些项也能导入。
+ * works（v2 起）、canvases（v3 起）、boxItems（v4 起）、cutouts（v5 起）、proEdits（v6 起）为可选，旧备份没有这些项也能导入。
+ * 专业编辑保存的 PSD 作为普通素材存在 assets 中（mimeType 为 PSD），随 assets 一起备份。
  * assets[].data、boxItems[].thumb、cutouts[].mask 为 base64 编码的二进制。
  * format 只在文件结构本身变化时递增；dbVersion 记录导出时的数据库版本，导入时据此补全旧字段。
  */
@@ -20,16 +21,25 @@ export interface BackupSummary {
   canvases: number
   boxItems: number
   cutouts: number
+  proEdits: number
   assets: number
 }
 
 /** 生成备份文件。逐段拼接成 Blob，避免把全部图片拼成一个超长字符串。 */
 export async function exportBackup(): Promise<{ file: File; summary: BackupSummary }> {
-  const [entries, works, canvases, boxItems, cutouts, assets] = await db.transaction(
+  const [entries, works, canvases, boxItems, cutouts, proEdits, assets] = await db.transaction(
     'r',
-    [db.entries, db.works, db.canvases, db.boxItems, db.cutouts, db.assets],
+    [db.entries, db.works, db.canvases, db.boxItems, db.cutouts, db.proEdits, db.assets],
     () =>
-      Promise.all([db.entries.toArray(), db.works.toArray(), db.canvases.toArray(), db.boxItems.toArray(), db.cutouts.toArray(), db.assets.toArray()]),
+      Promise.all([
+        db.entries.toArray(),
+        db.works.toArray(),
+        db.canvases.toArray(),
+        db.boxItems.toArray(),
+        db.cutouts.toArray(),
+        db.proEdits.toArray(),
+        db.assets.toArray(),
+      ]),
   )
   const cutoutsForBackup: BackupCutout[] = []
   for (const c of cutouts) cutoutsForBackup.push({ ...c, mask: await toBase64(c.mask) })
@@ -45,6 +55,7 @@ export async function exportBackup(): Promise<{ file: File; summary: BackupSumma
     canvases,
     boxItems: boxForBackup,
     cutouts: cutoutsForBackup,
+    proEdits,
   }
   const headJson = JSON.stringify(head)
   const parts: BlobPart[] = [headJson.slice(0, -1), ',"assets":[']
@@ -59,7 +70,7 @@ export async function exportBackup(): Promise<{ file: File; summary: BackupSumma
 
   const stamp = head.exportedAt.slice(0, 16).replace(/[-:T]/g, '')
   const file = new File(parts, `between-pages-backup-${stamp}.json`, { type: 'application/json' })
-  return { file, summary: { entries: entries.length, works: works.length, canvases: canvases.length, boxItems: boxItems.length, cutouts: cutouts.length, assets: assets.length } }
+  return { file, summary: { entries: entries.length, works: works.length, canvases: canvases.length, boxItems: boxItems.length, cutouts: cutouts.length, proEdits: proEdits.length, assets: assets.length } }
 }
 
 /**
@@ -73,7 +84,7 @@ export async function importBackup(file: File): Promise<BackupSummary> {
   } catch {
     throw new Error('无法读取文件，它不是有效的备份文件。')
   }
-  const b = raw as { app?: string; format?: number; entries?: unknown; works?: unknown; canvases?: unknown; boxItems?: unknown; cutouts?: unknown; assets?: unknown }
+  const b = raw as { app?: string; format?: number; entries?: unknown; works?: unknown; canvases?: unknown; boxItems?: unknown; cutouts?: unknown; proEdits?: unknown; assets?: unknown }
   if (b?.app !== APP || typeof b.format !== 'number') throw new Error('这不是页间的备份文件。')
   if (b.format > BACKUP_FORMAT) throw new Error('这个备份来自更新版本的页间，请先更新应用。')
   if (!Array.isArray(b.entries) || !Array.isArray(b.assets)) throw new Error('备份文件内容不完整。')
@@ -96,12 +107,15 @@ export async function importBackup(file: File): Promise<BackupSummary> {
   const cutouts: Cutout[] = (Array.isArray(b.cutouts) ? (b.cutouts as BackupCutout[]) : [])
     .filter((c) => typeof c?.id === 'string' && typeof c.sourceAssetId === 'string' && typeof c.mask === 'string')
     .map((c) => ({ ...c, path: Array.isArray(c.path) ? c.path : [], mask: fromBase64(c.mask) }))
+  const proEdits: ProEdit[] = (Array.isArray(b.proEdits) ? (b.proEdits as ProEdit[]) : []).filter(
+    (p) => typeof p?.id === 'string' && typeof p.sourceAssetId === 'string',
+  ).map((p) => ({ ...p, psdAssetId: typeof p.psdAssetId === 'string' ? p.psdAssetId : null, editor: 'photopea' as const }))
   const assets: Asset[] = (b.assets as BackupAsset[])
     .filter((a) => typeof a?.id === 'string' && typeof a.data === 'string')
     .map((a) => ({ ...a, data: fromBase64(a.data) }))
 
-  const added: BackupSummary = { entries: 0, works: 0, canvases: 0, boxItems: 0, cutouts: 0, assets: 0 }
-  await db.transaction('rw', [db.entries, db.works, db.canvases, db.boxItems, db.cutouts, db.assets], async () => {
+  const added: BackupSummary = { entries: 0, works: 0, canvases: 0, boxItems: 0, cutouts: 0, proEdits: 0, assets: 0 }
+  await db.transaction('rw', [db.entries, db.works, db.canvases, db.boxItems, db.cutouts, db.proEdits, db.assets], async () => {
     const existingAssets = new Set(await db.assets.toCollection().primaryKeys())
     const newAssets = assets.filter((a) => !existingAssets.has(a.id))
     await db.assets.bulkPut(newAssets)
@@ -132,6 +146,11 @@ export async function importBackup(file: File): Promise<BackupSummary> {
     const newerCutouts = cutouts.filter((c, i) => isNewer(c, localCutouts[i]))
     await db.cutouts.bulkPut(newerCutouts)
     added.cutouts = newerCutouts.length
+
+    const localPro = await db.proEdits.bulkGet(proEdits.map((p) => p.id))
+    const newerPro = proEdits.filter((p, i) => isNewer(p, localPro[i]))
+    await db.proEdits.bulkPut(newerPro)
+    added.proEdits = newerPro.length
   })
   return added
 }

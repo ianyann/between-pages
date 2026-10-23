@@ -15,13 +15,15 @@ import Diagnostics from './pages/Diagnostics'
 import Backup from './pages/Backup'
 // 创作桌依赖体积较大的画布库，按需加载，不拖慢其他页面
 const Studio = lazy(() => import('./studio/Studio'))
+// 专业编辑器（嵌入第三方 Photopea 的实验功能），与创作桌完全隔离
+const ProEditor = lazy(() => import('./pro/ProEditor'))
 
 requestPersistentStorage()
 
 function Layout() {
   const { pathname } = useLocation()
   // 创作桌占满整个屏幕，不使用页面的窄栏布局
-  if (pathname.endsWith('/studio'))
+  if (pathname.endsWith('/studio') || pathname.startsWith('/pro/'))
     return (
       <>
         <DbStatus />
@@ -109,6 +111,14 @@ createRoot(document.getElementById('root')!).render(
             element={
               <Suspense fallback={<p className="py-20 text-center text-sm text-mute">正在打开创作桌…</p>}>
                 <Studio />
+              </Suspense>
+            }
+          />
+          <Route
+            path="pro/:assetId"
+            element={
+              <Suspense fallback={<p className="py-20 text-center text-sm text-mute">正在打开…</p>}>
+                <ProEditor />
               </Suspense>
             }
           />

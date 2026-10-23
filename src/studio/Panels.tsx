@@ -1,5 +1,6 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import {
   BOX_CATEGORIES,
   db,
@@ -85,6 +86,7 @@ export function AddPanel({ tab, entry, importing, onAddImage, onImport, onAddTex
 /** 素材盒：跨日记复用的图片收藏。缩略图来自 boxItems，不加载原图。 */
 function BoxPanel({ importing, onAddImage, onImport }: Pick<AddProps, 'importing' | 'onAddImage' | 'onImport'>) {
   const items = useLiveQuery(() => db.boxItems.orderBy('addedAt').reverse().toArray(), [])
+  const withPsd = new Set(useLiveQuery(async () => (await db.proEdits.toArray()).filter((p) => p.psdAssetId).map((p) => p.id), []) ?? [])
   const [filter, setFilter] = useState<BoxCategory | 'all'>('all')
   const [importCategory, setImportCategory] = useState<BoxCategory>('其他')
   const [query, setQuery] = useState('')
@@ -152,7 +154,7 @@ function BoxPanel({ importing, onAddImage, onImport }: Pick<AddProps, 'importing
       ) : (
         <div className="grid grid-cols-3 gap-2">
           {shown.map((it) => (
-            <BoxThumb key={it.id} item={it} onClick={() => onAddImage(it.id)} />
+            <BoxThumb key={it.id} item={it} hasPsd={withPsd.has(it.id)} onClick={() => onAddImage(it.id)} />
           ))}
         </div>
       )}
@@ -160,7 +162,9 @@ function BoxPanel({ importing, onAddImage, onImport }: Pick<AddProps, 'importing
   )
 }
 
-function BoxThumb({ item, onClick }: { item: BoxItem; onClick: () => void }) {
+function BoxThumb({ item, hasPsd, onClick }: { item: BoxItem; hasPsd: boolean; onClick: () => void }) {
+  const navigate = useNavigate()
+  const { pathname } = useLocation()
   // 在同一个 effect 里创建并释放临时 URL，避免被提前释放
   const [url, setUrl] = useState<string>()
   useEffect(() => {
@@ -169,15 +173,26 @@ function BoxThumb({ item, onClick }: { item: BoxItem; onClick: () => void }) {
     return () => URL.revokeObjectURL(u)
   }, [item.thumb, item.thumbType])
   return (
-    <button
-      {...dragProps(item.id)}
-      onClick={onClick}
-      title={item.name}
-      aria-label={`添加素材 ${item.name}`}
-      className="checker aspect-square overflow-hidden border border-line"
-    >
-      {url && <img src={url} alt="" draggable={false} className="h-full w-full object-contain" />}
-    </button>
+    <div className="relative">
+      <button
+        {...dragProps(item.id)}
+        onClick={onClick}
+        title={item.name}
+        aria-label={`添加素材 ${item.name}`}
+        className="checker block aspect-square w-full overflow-hidden border border-line"
+      >
+        {url && <img src={url} alt="" draggable={false} className="h-full w-full object-contain" />}
+      </button>
+      {hasPsd && <span className="pointer-events-none absolute bottom-1 left-1 bg-ink px-1 text-[9px] text-paper">PSD</span>}
+      <button
+        onClick={() => navigate(`/pro/${item.id}?from=${encodeURIComponent(pathname)}`)}
+        aria-label={`使用专业编辑器打开 ${item.name}`}
+        title="使用专业编辑器打开（第三方 Photopea，实验）"
+        className="absolute top-1 right-1 rounded-full border border-line bg-paper/90 px-1.5 text-[10px] leading-4"
+      >
+        专业
+      </button>
+    </div>
   )
 }
 
