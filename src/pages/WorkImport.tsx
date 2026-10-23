@@ -1,14 +1,17 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { db, DuplicateSourceError, findWorkBySource, importWork, linkSourceToWork, WORK_TYPES, type Asset, type Work, type WorkSource, type WorkType } from '../db'
-import { ADAPTERS, downloadCover, fetchMetadata, recognize, describeError, type FetchOutcome } from '../import/adapters'
-import { extractUrl, PLATFORM_LABELS, sourceKey, titleFromPastedText, type ParsedSource } from '../import/parse'
+import { db, DuplicateSourceError, findWorkBySource, importWork, linkSourceToWork, WORK_TYPES, workTypeLabel, type Asset, type Work, type WorkSource, type WorkType } from '../db'
+import { ADAPTERS, baseMetadata, downloadCover, fetchMetadata, recognize, describeError, type FetchOutcome } from '../import/adapters'
+import { candidatesFromText } from '../import/assist'
+import { lookupIsbn, normalizeIsbn } from '../import/isbn'
+import { extractUrl, PLATFORM_LABELS, sourceKey, type ParsedSource } from '../import/parse'
 import { assetToUrl, fileToAsset, newId } from '../lib'
 
 /**
  * 从链接导入作品：粘贴 → 识别来源 → 获取可用信息 → 预览并修改 → 查重 → 保存。
- * 任何一步失败都可以继续手动填写；封面下载失败不影响创建。
+ * 自动获取失败时保留来源链接与编号，可以手动填写、从分享文字中提取候选、用 ISBN 查询，或上传封面；
+ * 任何辅助结果都只填入空白且未被用户修改过的字段，其余以「候选」形式由用户决定是否使用。
  */
 
 type Phase =
@@ -17,7 +20,10 @@ type Phase =
   | { kind: 'duplicate'; source: ParsedSource; work: Work }
   | { kind: 'preview'; source: ParsedSource; outcome: FetchOutcome }
 
-type Origin = 'fetched' | 'pasted' | 'link' | null
+type Field = 'title' | 'author' | 'type' | 'isbn'
+type Candidate = { field: Field; value: string; from: string }
+
+const FIELD_LABELS: Record<Field | 'coverUrl' | 'category', string> = { title: '标题', author: '作者', type: '类别', category: '类别', isbn: 'ISBN', coverUrl: '封面' }
 
 export default function WorkImport() {
   const navigate = useNavigate()
@@ -26,16 +32,25 @@ export default function WorkImport() {
   const [phase, setPhase] = useState<Phase>({ kind: 'input' })
   const abortRef = useRef<AbortController | null>(null)
 
-  // 预览表单
-  const [title, setTitle] = useState('')
-  const [author, setAuthor] = useState('')
-  const [type, setType] = useState<WorkType | null>(null)
-  const [origin, setOrigin] = useState<{ title: Origin; author: Origin; type: Origin }>({ title: null, author: null, type: null })
+  // 预览表单。values 为当前值，origin 为值的来源说明，touched 为用户亲手改过的字段（不会被自动覆盖）
+  const [values, setValuesState] = useState<Record<Field, string>>({ title: '', author: '', type: '', isbn: '' })
+  const valuesRef = useRef(values)
+  const setValues = (next: Record<Field, string>) => {
+    valuesRef.current = next
+    setValuesState(next)
+  }
+  const [origin, setOrigin] = useState<Partial<Record<Field, string>>>({})
+  const touched = useRef(new Set<Field>())
+  const [candidates, setCandidates] = useState<Candidate[]>([])
   const [cover, setCover] = useState<Asset | null>(null)
   const [coverUrl, setCoverUrl] = useState<string | null>(null)
-  const [coverFrom, setCoverFrom] = useState<'fetched' | 'upload' | null>(null)
+  const [coverFrom, setCoverFrom] = useState<{ kind: 'fetched' | 'upload'; label: string; url?: string } | null>(null)
   const [coverNote, setCoverNote] = useState('')
   const [coverBusy, setCoverBusy] = useState(false)
+  const coverTouched = useRef(false)
+  const [shareText, setShareText] = useState('')
+  const [isbnInput, setIsbnInput] = useState('')
+  const [isbnState, setIsbnState] = useState<{ busy: boolean; lines: string[] }>({ busy: false, lines: [] })
   const [mode, setMode] = useState<'new' | 'link'>('new')
   const [linkTo, setLinkTo] = useState('')
   const [saving, setSaving] = useState(false)
@@ -59,6 +74,36 @@ export default function WorkImport() {
     [],
   )
 
+  /** 用户输入：记为已修改，之后的自动结果不会覆盖它。 */
+  function edit(field: Field, value: string) {
+    touched.current.add(field)
+    setValues({ ...valuesRef.current, [field]: value })
+    setOrigin((o) => ({ ...o, [field]: undefined }))
+  }
+
+  /** 自动或辅助结果：字段为空且用户没改过时直接填入，否则作为候选。 */
+  function offer(list: Candidate[]) {
+    const extra: Candidate[] = []
+    const next = { ...valuesRef.current }
+    const tags: Partial<Record<Field, string>> = {}
+    for (const c of list) {
+      if (!next[c.field] && !touched.current.has(c.field)) {
+        next[c.field] = c.value
+        tags[c.field] = c.from
+      } else if (next[c.field] !== c.value) extra.push(c)
+    }
+    setValues(next)
+    setOrigin((o) => ({ ...o, ...tags }))
+    setCandidates((old) => [...old.filter((o) => !extra.some((e) => e.field === o.field && e.value === o.value)), ...extra])
+  }
+
+  function useCandidate(c: Candidate) {
+    touched.current.add(c.field)
+    setValues({ ...valuesRef.current, [c.field]: c.value })
+    setOrigin((o) => ({ ...o, [c.field]: c.from }))
+    setCandidates((l) => l.filter((x) => x !== c))
+  }
+
   async function start(input = text) {
     setError('')
     const url = extractUrl(input) ?? input.trim()
@@ -73,36 +118,52 @@ export default function WorkImport() {
     abortRef.current = ctl
     setPhase({ kind: 'fetching', source })
     const outcome = await fetchMetadata(source, ctl.signal)
-    if (ctl.signal.aborted && outcome.status === 'failed') return // 用户点了「跳过」，已进入预览
+    if (ctl.signal.aborted) return // 用户点了「跳过」，已进入预览
     openPreview(source, outcome, input)
-    if (outcome.metadata.coverUrl) loadRemoteCover(outcome.metadata.coverUrl, ctl.signal)
+    if (outcome.metadata.coverUrl) loadRemoteCover(outcome.metadata.coverUrl, outcome.metadata.provider ?? '', ctl.signal)
   }
 
-  /** 进入预览：只填入确实获得的信息；书名号中的标题来自用户粘贴的文字，单独标注。 */
+  /** 进入预览：只填入确实获得的信息；粘贴文字中的候选单独标注来源。 */
   function openPreview(source: ParsedSource, outcome: FetchOutcome, input: string) {
     const m = outcome.metadata
-    const pasted = titleFromPastedText(input)
-    setTitle(m.title ?? pasted ?? '')
-    setAuthor(m.author ?? '')
-    setType(m.category)
-    setOrigin({
-      title: m.title ? 'fetched' : pasted ? 'pasted' : null,
-      author: m.author ? 'fetched' : null,
-      type: m.category ? (m.fields.includes('category') ? 'fetched' : 'link') : null,
-    })
+    touched.current.clear()
+    setValues({ title: '', author: '', type: '', isbn: '' })
+    setOrigin({})
+    setCandidates([])
     setCoverNote('')
     setPhase({ kind: 'preview', source, outcome })
+    const from = (m.provider ?? '').trim()
+    const list: Candidate[] = []
+    if (m.title) list.push({ field: 'title', value: m.title, from: `来自${sp(from)}`.trim() })
+    if (m.author) list.push({ field: 'author', value: m.author, from: `来自${sp(from)}`.trim() })
+    if (m.category) list.push({ field: 'type', value: m.category, from: m.fields.includes('category') ? `来自${sp(from)}`.trim() : '由链接判断' })
+    if (m.isbn) list.push({ field: 'isbn', value: normalizeIsbn(m.isbn) ?? m.isbn, from: `来自${sp(from)}`.trim() })
+    list.push(...pastedCandidates(input))
+    offer(list)
+    if (m.isbn) setIsbnInput(normalizeIsbn(m.isbn) ?? m.isbn)
   }
 
-  async function loadRemoteCover(url: string, signal: AbortSignal) {
+  function pastedCandidates(input: string): Candidate[] {
+    const c = candidatesFromText(input)
+    const from = '来自粘贴的文字，请确认'
+    return [
+      ...(c.title ? [{ field: 'title' as const, value: c.title, from }] : []),
+      ...(c.author ? [{ field: 'author' as const, value: c.author, from }] : []),
+      ...(c.isbn ? [{ field: 'isbn' as const, value: c.isbn, from }] : []),
+    ]
+  }
+
+  async function loadRemoteCover(url: string, provider: string, signal: AbortSignal) {
+    if (coverTouched.current) return
     setCoverBusy(true)
     try {
       const file = await downloadCover(url, signal)
       const asset = await fileToAsset(file, { workId: workId.current })
       if (!asset.width) throw new Error('封面图片无法读取')
-      if (signal.aborted) return
+      if (signal.aborted || coverTouched.current) return
       showCover(asset)
-      setCoverFrom('fetched')
+      setCoverFrom({ kind: 'fetched', label: `来自${sp(provider.trim())}`.trim(), url })
+      setCoverNote('')
     } catch (err) {
       if (!signal.aborted) setCoverNote(`封面没能下载（${describeError(err)}）。作品仍可创建，可以手动上传封面。`)
     } finally {
@@ -112,13 +173,13 @@ export default function WorkImport() {
 
   async function pickCover(file: File | undefined) {
     if (!file) return
-    abortRef.current?.abort() // 停止仍在进行的自动下载
+    coverTouched.current = true
     setCoverBusy(true)
     try {
       const asset = await fileToAsset(file, { workId: workId.current })
       if (!asset.width) throw new Error()
       showCover(asset)
-      setCoverFrom('upload')
+      setCoverFrom({ kind: 'upload', label: '已上传' })
       setCoverNote('')
     } catch {
       setCoverNote(`无法读取图片：${file.name}`)
@@ -130,7 +191,37 @@ export default function WorkImport() {
   function skipFetch() {
     if (phase.kind !== 'fetching') return
     abortRef.current?.abort()
-    openPreview(phase.source, { status: 'failed', metadata: ADAPTERS[phase.source.platform].normalizeMetadata(phase.source, null).metadata, reason: '已跳过自动获取' }, text)
+    openPreview(phase.source, { status: 'not-found', metadata: baseMetadata(phase.source), reason: '已跳过自动获取。' }, text)
+  }
+
+  function extractShare() {
+    const list = pastedCandidates(shareText)
+    const url = extractUrl(shareText)
+    if (!list.length) return setHint('没有在这段文字中找到书名号《》中的标题、作者或 ISBN。')
+    setHint(url && phase.kind === 'preview' && recognize(url).ok && sourceKey((recognize(url) as { source: ParsedSource }).source) !== sourceKey(phase.source) ? '注意：这段文字中的链接指向另一部作品。' : '')
+    offer(list)
+    const isbn = list.find((c) => c.field === 'isbn')
+    if (isbn && !isbnInput) setIsbnInput(isbn.value)
+  }
+
+  async function queryIsbn() {
+    const isbn = normalizeIsbn(isbnInput)
+    if (!isbn) return setIsbnState({ busy: false, lines: ['ISBN 格式或校验位不正确。'] })
+    setIsbnState({ busy: true, lines: [] })
+    const ctl = new AbortController()
+    abortRef.current = ctl
+    const r = await lookupIsbn(isbn, ctl.signal)
+    if (ctl.signal.aborted) return
+    const lines = r.attempts.map((a) => `${a.provider}：${a.result}`)
+    setIsbnState({ busy: false, lines })
+    if (!r.title) return
+    const from = `来自 ${r.provider}（ISBN ${isbn}）`
+    offer([
+      { field: 'isbn', value: isbn, from },
+      { field: 'title', value: r.title, from },
+      ...(r.author ? [{ field: 'author' as const, value: r.author, from }] : []),
+    ])
+    if (r.coverUrl && !cover) loadRemoteCover(r.coverUrl, `${r.provider}（ISBN 已核对）`, ctl.signal)
   }
 
   function cancel() {
@@ -143,13 +234,15 @@ export default function WorkImport() {
     const { source, outcome } = phase
     const m = outcome.metadata
     const now = Date.now()
+    const isbn = values.isbn ? normalizeIsbn(values.isbn) : null
+    if (values.isbn && !isbn) return setHint('ISBN 格式或校验位不正确。')
     const record: WorkSource = {
       platform: source.platform,
       externalId: source.externalId,
       url: source.canonicalUrl,
       addedAt: now,
       ...(m.provider && m.fields.length ? { fetched: { provider: m.provider, fields: m.fields, fetchedAt: now } } : {}),
-      ...(coverFrom === 'fetched' && m.coverUrl ? { coverUrl: m.coverUrl } : {}),
+      ...(coverFrom?.kind === 'fetched' && coverFrom.url ? { coverUrl: coverFrom.url } : {}),
     }
     setSaving(true)
     setHint('')
@@ -159,16 +252,17 @@ export default function WorkImport() {
         await linkSourceToWork(linkTo, record)
         navigate(`/work/${linkTo}`, { replace: true })
       } else {
-        if (!title.trim()) throw new Error('请填写作品名称。')
-        if (!type) throw new Error('请选择类别。')
+        if (!values.title.trim()) throw new Error('请填写作品名称。')
+        if (!values.type) throw new Error('请选择类别。')
         const work: Work = {
           id: workId.current,
-          name: title.trim(),
-          type,
+          name: values.title.trim(),
+          type: values.type as WorkType,
           coverAssetId: cover?.id ?? null,
           createdAt: now,
           updatedAt: now,
-          ...(author.trim() ? { author: author.trim() } : {}),
+          ...(values.author.trim() ? { author: values.author.trim() } : {}),
+          ...(isbn ? { isbn } : {}),
           sources: [record],
         }
         await importWork(work, cover)
@@ -222,9 +316,10 @@ export default function WorkImport() {
         <section className="mt-12 text-xs leading-relaxed text-mute">
           <p className="mb-2 tracking-[0.2em]">支持的链接</p>
           <ul className="space-y-1">
-            <li>起点中文网 · 晋江文学城 · 长佩文学 · 豆瓣读书 / 电影：识别来源与编号，信息需手动补全（这些平台不提供可供网页读取的公开接口）</li>
-            <li>Goodreads：通过 Open Library 公开数据查询标题、作者与封面，仅在编号完全对应时自动填入</li>
+            <li>起点中文网 · 晋江文学城 · 长佩文学 · 豆瓣读书 / 电影：识别来源与编号，并尝试读取作品页；读不到时会说明原因，可手动补全。</li>
+            <li>Goodreads：通过 Open Library 公开数据查询，仅在编号完全对应时自动填入。</li>
           </ul>
+          <Link to="/library/import/check" className="mt-3 inline-block underline">网络检测：查看各平台在这台设备上能否读取</Link>
         </section>
       </div>
     )
@@ -253,7 +348,7 @@ export default function WorkImport() {
         <Header onCancel={cancel} label="从链接导入" />
         <SourceLine source={phase.source} />
         <p role="status" className="mt-8 text-sm text-mute">
-          正在从 Open Library 查询公开信息…
+          {phase.source.platform === 'goodreads' ? '正在从 Open Library 查询公开信息…' : `正在读取${PLATFORM_LABELS[phase.source.platform]}作品页…`}
           <button onClick={skipFetch} className="ml-3 underline">跳过，手动填写</button>
         </p>
       </div>
@@ -261,22 +356,30 @@ export default function WorkImport() {
 
   // —— 预览与确认 ——
   const { source, outcome } = phase
+  const requested = ADAPTERS[source.platform].requestUrl(source)
   const fetchLine =
     outcome.status === 'ok'
-      ? `已从 ${outcome.metadata.provider} 获取：${outcome.metadata.fields.map((f) => FIELD_LABELS[f]).join('、')}。${outcome.notes.join('')}请核对后保存。`
-      : outcome.status === 'unsupported'
-        ? `未自动获取：${outcome.reason}`
-        : outcome.status === 'not-found'
-          ? `未自动获取：${outcome.reason} 请手动填写。`
-          : `自动获取失败：${outcome.reason}。请手动填写。`
-  const sameName = (works ?? []).filter((w) => norm(w.name) === norm(title) && title.trim())
+      ? `已从${sp(outcome.metadata.provider ?? '')}获取：${outcome.metadata.fields.map((f) => FIELD_LABELS[f]).join('、')}。${outcome.notes.join('')}请核对后保存。`
+      : outcome.status === 'not-found'
+        ? `未取得作品信息：${outcome.reason}`
+        : `自动获取失败：${outcome.reason}。`
+  const sameName = (works ?? []).filter((w) => norm(w.name) === norm(values.title) && values.title.trim())
   const linkable = [...(works ?? [])].sort((a, b) => Number(sameName.includes(b)) - Number(sameName.includes(a)) || a.name.localeCompare(b.name, 'zh'))
 
   return (
     <div className="pb-24">
       <Header onCancel={cancel} label={saving ? '保存中…' : '确认信息'} onSave={save} saveDisabled={saving || coverBusy} saveLabel={mode === 'link' ? '关联' : '保存'} />
       <SourceLine source={source} />
-      <p role="status" className={`mt-3 text-sm ${outcome.status === 'ok' ? '' : 'text-mute'}`}>{fetchLine}</p>
+      <div role="status" className={`mt-3 text-sm ${outcome.status === 'ok' ? '' : 'text-mute'}`}>
+        <p>{fetchLine}</p>
+        {outcome.status !== 'ok' && (
+          <p className="mt-1 text-xs break-all">
+            实际请求：{requested}
+            {outcome.status === 'failed' && ` · 原因类型：${FAILURE_LABELS[outcome.failure] ?? outcome.failure}`}
+            {' · '}来源链接与编号已保留，可以手动填写或使用下面的辅助补全。
+          </p>
+        )}
+      </div>
 
       <div className="mt-6 flex gap-5 text-sm">
         <label className="flex items-center gap-1.5">
@@ -301,86 +404,171 @@ export default function WorkImport() {
           <p className="text-xs text-mute">只为该作品添加这个来源链接，不修改它的名称、作者、类别与封面。</p>
         </div>
       ) : (
-        <div className="mt-8 flex flex-col gap-8 sm:flex-row">
-          <div className="w-40 shrink-0">
-            <label className="block aspect-[3/4] cursor-pointer overflow-hidden border border-dashed border-mute/50">
-              {coverUrl ? (
-                <img src={coverUrl} alt="封面预览" className="h-full w-full object-cover" />
-              ) : (
-                <span className="flex h-full flex-col items-center justify-center gap-1 text-mute">
-                  <span className="text-2xl font-light">+</span>
-                  <span className="text-xs">{coverBusy ? '正在下载封面…' : '上传封面'}</span>
-                </span>
-              )}
-              <input
-                id="import-cover"
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={(e) => {
-                  pickCover(e.target.files?.[0])
-                  e.target.value = ''
-                }}
-              />
-            </label>
-            {cover && (
-              <p className="mt-2 flex justify-between text-xs text-mute">
-                <span>{coverFrom === 'fetched' ? `来自 ${outcome.metadata.provider}` : '已上传'}</span>
-                <button
-                  onClick={() => {
-                    showCover(null)
-                    setCoverFrom(null)
+        <>
+          <div className="mt-8 flex flex-col gap-8 sm:flex-row">
+            <div className="w-40 shrink-0">
+              <label className="block aspect-[3/4] cursor-pointer overflow-hidden border border-dashed border-mute/50">
+                {coverUrl ? (
+                  <img src={coverUrl} alt="封面预览" className="h-full w-full object-cover" />
+                ) : (
+                  <span className="flex h-full flex-col items-center justify-center gap-1 text-mute">
+                    <span className="text-2xl font-light">+</span>
+                    <span className="text-xs">{coverBusy ? '正在下载封面…' : '上传封面'}</span>
+                  </span>
+                )}
+                <input
+                  id="import-cover"
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => {
+                    pickCover(e.target.files?.[0])
+                    e.target.value = ''
                   }}
-                >
-                  移除
-                </button>
-              </p>
-            )}
-            {coverNote && <p className="mt-2 text-xs text-red-700">{coverNote}</p>}
+                />
+              </label>
+              {cover && (
+                <p className="mt-2 flex justify-between gap-2 text-xs text-mute">
+                  <span className="min-w-0 truncate">{coverFrom?.label}</span>
+                  <button
+                    onClick={() => {
+                      coverTouched.current = true
+                      showCover(null)
+                      setCoverFrom(null)
+                    }}
+                  >
+                    移除
+                  </button>
+                </p>
+              )}
+              {coverNote && <p className="mt-2 text-xs text-red-700">{coverNote}</p>}
+            </div>
+
+            <div className="min-w-0 flex-1 space-y-8">
+              <FieldBox label="作品名称" tag={origin.title}>
+                <input
+                  id="import-title"
+                  value={values.title}
+                  onChange={(e) => edit('title', e.target.value)}
+                  placeholder="未能自动获取，请填写"
+                  className="w-full border-b border-line bg-transparent pb-2 font-serif text-2xl outline-none placeholder:text-base placeholder:text-mute/60 focus:border-ink"
+                />
+              </FieldBox>
+              <FieldBox label="作者" tag={origin.author}>
+                <input
+                  id="import-author"
+                  value={values.author}
+                  onChange={(e) => edit('author', e.target.value)}
+                  placeholder="可选"
+                  className="w-full border-b border-line bg-transparent pb-2 outline-none placeholder:text-mute/60 focus:border-ink"
+                />
+              </FieldBox>
+              <FieldBox label="类别" tag={origin.type}>
+                <div className="flex flex-wrap gap-2">
+                  {WORK_TYPES.map((t) => (
+                    <button
+                      key={t.value}
+                      onClick={() => edit('type', t.value)}
+                      className={`rounded-full border px-3.5 py-1 text-sm ${values.type === t.value ? 'border-ink bg-ink text-paper' : 'border-line text-mute'}`}
+                    >
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
+                {!values.type && source.kind === 'screen' && <p className="mt-2 text-xs text-mute">豆瓣的影视链接不区分电影与电视剧，请选择。</p>}
+              </FieldBox>
+              <FieldBox label="ISBN" tag={origin.isbn}>
+                <input
+                  id="import-isbn"
+                  value={values.isbn}
+                  inputMode="numeric"
+                  onChange={(e) => edit('isbn', e.target.value)}
+                  placeholder="可选"
+                  className="w-full border-b border-line bg-transparent pb-2 tabular-nums outline-none placeholder:text-mute/60 focus:border-ink"
+                />
+              </FieldBox>
+            </div>
           </div>
 
-          <div className="min-w-0 flex-1 space-y-8">
-            <Field label="作品名称" origin={origin.title} provider={outcome.metadata.provider}>
-              <input
-                id="import-title"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="未能自动获取，请填写"
-                className="w-full border-b border-line bg-transparent pb-2 font-serif text-2xl outline-none placeholder:text-base placeholder:text-mute/60 focus:border-ink"
-              />
-            </Field>
-            <Field label="作者" origin={origin.author} provider={outcome.metadata.provider}>
-              <input
-                id="import-author"
-                value={author}
-                onChange={(e) => setAuthor(e.target.value)}
-                placeholder="可选"
-                className="w-full border-b border-line bg-transparent pb-2 outline-none placeholder:text-mute/60 focus:border-ink"
-              />
-            </Field>
-            <Field label="类别" origin={origin.type} provider={outcome.metadata.provider}>
-              <div className="flex flex-wrap gap-2">
-                {WORK_TYPES.map((t) => (
-                  <button
-                    key={t.value}
-                    onClick={() => setType(t.value)}
-                    className={`rounded-full border px-3.5 py-1 text-sm ${type === t.value ? 'border-ink bg-ink text-paper' : 'border-line text-mute'}`}
-                  >
-                    {t.label}
-                  </button>
+          {candidates.length > 0 && (
+            <section className="mt-8">
+              <p className="mb-2 text-xs tracking-[0.2em] text-mute">候选信息（不会覆盖你已填写的内容）</p>
+              <ul className="space-y-1.5 text-sm">
+                {candidates.map((c) => (
+                  <li key={`${c.field}:${c.value}`} className="flex items-baseline gap-3">
+                    <span className="shrink-0 text-mute">{FIELD_LABELS[c.field]}</span>
+                    <span className="min-w-0 flex-1 truncate">{c.field === 'type' ? workTypeLabel(c.value as WorkType) : c.value}</span>
+                    <span className="hidden shrink-0 text-xs text-mute sm:inline">{c.from}</span>
+                    <button onClick={() => useCandidate(c)} className="shrink-0 rounded-full border border-line px-3 text-xs">使用</button>
+                  </li>
                 ))}
+              </ul>
+            </section>
+          )}
+
+          <section className="mt-10 border-t border-line pt-6">
+            <p className="mb-4 text-xs tracking-[0.2em] text-mute">辅助补全</p>
+            <div className="space-y-6">
+              <div>
+                <label htmlFor="share-text" className="mb-1.5 block text-sm">从分享文字中提取</label>
+                <textarea
+                  id="share-text"
+                  value={shareText}
+                  rows={2}
+                  onChange={(e) => setShareText(e.target.value)}
+                  placeholder="粘贴 App「分享」或作品页上复制的文字，例如：《书名》作者：某某"
+                  className="w-full resize-none border-b border-line bg-transparent pb-1.5 text-sm outline-none placeholder:text-mute/60 focus:border-ink"
+                />
+                <button onClick={extractShare} disabled={!shareText.trim()} className="mt-2 rounded-full border border-ink px-4 py-1 text-xs disabled:opacity-40">提取候选</button>
               </div>
-              {!type && source.kind === 'screen' && <p className="mt-2 text-xs text-mute">豆瓣的影视链接不区分电影与电视剧，请选择。</p>}
-            </Field>
-          </div>
-        </div>
+              {(source.kind === 'book' || values.type === 'book') && (
+                <div>
+                  <label htmlFor="isbn-query" className="mb-1.5 block text-sm">用 ISBN 查询（Open Library / Google Books，结果须 ISBN 一致）</label>
+                  <div className="flex items-center gap-3">
+                    <input
+                      id="isbn-query"
+                      value={isbnInput}
+                      inputMode="numeric"
+                      onChange={(e) => setIsbnInput(e.target.value)}
+                      placeholder="978…"
+                      className="min-w-0 flex-1 border-b border-line bg-transparent pb-1.5 text-sm tabular-nums outline-none placeholder:text-mute/60 focus:border-ink"
+                    />
+                    <button onClick={queryIsbn} disabled={!isbnInput.trim() || isbnState.busy} className="shrink-0 rounded-full border border-ink px-4 py-1 text-xs disabled:opacity-40">
+                      {isbnState.busy ? '查询中…' : '查询'}
+                    </button>
+                  </div>
+                  {isbnState.lines.length > 0 && (
+                    <ul role="status" aria-label="ISBN 查询结果" className="mt-2 space-y-0.5 text-xs text-mute">
+                      {isbnState.lines.map((l) => (
+                        <li key={l}>{l}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+        </>
       )}
       {hint && <p role="alert" className="mt-6 text-sm text-red-700">{hint}</p>}
     </div>
   )
 }
 
-const FIELD_LABELS = { title: '标题', author: '作者', category: '类别', coverUrl: '封面' } as const
+export const FAILURE_LABELS: Record<string, string> = {
+  'cors-blocked': '跨域限制（服务器有响应，但不允许网页读取）',
+  unreachable: '无法连接',
+  timeout: '超时',
+  forbidden: '拒绝访问 / 验证页',
+  'rate-limited': '请求过于频繁',
+  'http-error': '服务错误',
+  'too-large': '响应过大',
+  'not-html': '不是网页',
+  other: '其他错误',
+}
+
+/** 中文里夹排的西文名称两侧加空格。 */
+const sp = (s: string) => (/^[A-Za-z]/.test(s) ? ` ${s} ` : s)
 
 const norm = (s: string) => s.replace(/[\s《》「」"'·:：]/g, '').toLowerCase()
 
@@ -414,13 +602,12 @@ function SourceLine({ source }: { source: ParsedSource }) {
   )
 }
 
-function Field({ label, origin, provider, children }: { label: string; origin: Origin; provider: string | null; children: React.ReactNode }) {
-  const tag = origin === 'fetched' ? `来自 ${provider}` : origin === 'pasted' ? '来自你粘贴的文字，请确认' : origin === 'link' ? '由链接判断' : null
+function FieldBox({ label, tag, children }: { label: string; tag?: string; children: ReactNode }) {
   return (
     <div>
-      <span className="mb-2 flex items-baseline justify-between text-xs tracking-[0.2em] text-mute">
+      <span className="mb-2 flex items-baseline justify-between gap-3 text-xs tracking-[0.2em] text-mute">
         {label}
-        {tag && <span className="tracking-normal">{tag}</span>}
+        {tag && <span className="truncate tracking-normal">{tag}</span>}
       </span>
       {children}
     </div>

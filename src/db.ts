@@ -169,6 +169,7 @@ export interface Work {
   createdAt: number
   updatedAt: number
   author?: string // v8 起，可选
+  isbn?: string // 可选，ISBN-13（来自作品页或用户确认的 ISBN 查询）
   sources?: WorkSource[] // v8 起：从链接导入或关联的来源；旧作品没有此字段
   sourceKeys?: string[] // 由 sources 计算的「platform:externalId」，用于查重（多值索引）
 }

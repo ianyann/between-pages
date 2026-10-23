@@ -1,16 +1,17 @@
 import type { WorkType } from '../db'
+import { extractHtmlMeta, FetchFailure, readable, readHtml, type FailureKind, type HtmlMeta } from './net'
 import { parseWorkUrl, type ParsedSource, type ParseResult, type Platform } from './parse'
 
 /**
  * 元数据适配器：recognize(url) → fetchMetadata(parsed) → normalizeMetadata(raw)。
  * 只返回确实获得的字段；没有把握的字段一律留空，交给用户填写。
  *
- * 页间是部署在 GitHub Pages 上的纯静态网页，没有服务器。浏览器只能读取明确允许跨域（CORS）的接口：
- * - 起点、晋江、长佩、豆瓣：没有面向第三方网页的公开接口，作品页也不允许跨域读取 → 只识别链接，不自动获取。
- * - Goodreads：旧 API 已停止发放密钥，不使用；改为查询 Open Library（公开、允许跨域），
- *   只接受记录中带有同一个 Goodreads ID 的结果，不按标题相似度猜测。
- *   Open Library 没有封面时，用它给出的 ISBN 查询 Google Books，并核对 ISBN 一致才采用封面。
- * 不使用代理、抓取服务、登录模拟或任何绕过手段。
+ * 页间部署在 GitHub Pages（纯静态，无服务器），所有请求都在用户的浏览器中直接发出：
+ * - Goodreads：不请求 goodreads.com；用 Goodreads 编号查询 Open Library（公开接口，允许跨域），
+ *   只接受记录中带有同一个编号的结果。Open Library 无封面时，按 ISBN 核对后用 Google Books 的封面。
+ * - 起点、晋江、长佩、豆瓣：直接请求作品页（不带 Cookie），只有在浏览器允许读取时才解析其中的
+ *   Open Graph / JSON-LD / 微数据。被跨域限制、超时、403、429 或跳转到验证页时，如实说明原因。
+ * 不使用代理、抓取服务、登录模拟、验证码绕过或任何反爬绕过手段。
  */
 
 export interface Metadata {
@@ -18,34 +19,31 @@ export interface Metadata {
   author: string | null
   category: WorkType | null
   coverUrl: string | null
+  isbn: string | null
   sourceUrl: string
   platform: Platform
   externalId: string
-  provider: string | null // 实际提供数据的服务，例如 Open Library
-  fields: ('title' | 'author' | 'category' | 'coverUrl')[] // 由提供方给出的字段
+  provider: string | null // 实际提供数据的来源，例如 Open Library、豆瓣作品页
+  fields: ('title' | 'author' | 'category' | 'coverUrl' | 'isbn')[] // 由提供方给出的字段
 }
 
 export type FetchOutcome =
   | { status: 'ok'; metadata: Metadata; notes: string[] }
-  | { status: 'unsupported'; metadata: Metadata; reason: string } // 平台不提供可合规读取的接口
-  | { status: 'not-found'; metadata: Metadata; reason: string }
-  | { status: 'failed'; metadata: Metadata; reason: string } // 网络 / 跨域 / 超时 / 数据异常
+  | { status: 'not-found'; metadata: Metadata; reason: string } // 请求成功，但没有可用的作品信息
+  | { status: 'failed'; metadata: Metadata; reason: string; failure: FailureKind | 'other' } // 请求本身失败
 
 export interface Adapter {
   platform: Platform
-  /** 是否能在浏览器中合规地获取元数据。 */
-  canFetch: boolean
-  /** 不能获取时给用户的说明。 */
-  limitation?: string
-  fetchMetadata?(p: ParsedSource, signal: AbortSignal): Promise<unknown>
-  normalizeMetadata(p: ParsedSource, raw: unknown): Omit<FetchOutcome, 'metadata'> & { metadata: Metadata }
+  /** 实际请求的地址（用于说明与诊断）。 */
+  requestUrl(p: ParsedSource): string
+  fetchMetadata(p: ParsedSource, signal: AbortSignal): Promise<unknown>
+  normalizeMetadata(p: ParsedSource, raw: unknown): FetchOutcome
 }
 
 const env = import.meta.env as Record<string, string | undefined>
 export const OPEN_LIBRARY = env.VITE_OPENLIBRARY_URL || 'https://openlibrary.org'
 export const OPEN_LIBRARY_COVERS = env.VITE_OPENLIBRARY_COVERS_URL || 'https://covers.openlibrary.org'
 export const GOOGLE_BOOKS = env.VITE_GOOGLE_BOOKS_URL || 'https://www.googleapis.com'
-const FETCH_TIMEOUT = 12_000
 const MAX_JSON_BYTES = 2 * 1024 * 1024
 
 /** 链接本身就能确定的类别。豆瓣桌面版影视链接不区分电影与电视剧，留空。 */
@@ -53,28 +51,148 @@ export function categoryFromLink(p: ParsedSource): WorkType | null {
   return p.kind === 'novel' ? 'novel' : p.kind === 'book' ? 'book' : p.kind === 'tv' ? 'tv' : null
 }
 
-function baseMetadata(p: ParsedSource): Metadata {
-  const category = categoryFromLink(p)
-  return { title: null, author: null, category, coverUrl: null, sourceUrl: p.canonicalUrl, platform: p.platform, externalId: p.externalId, provider: null, fields: [] }
+export function baseMetadata(p: ParsedSource): Metadata {
+  return { title: null, author: null, category: categoryFromLink(p), coverUrl: null, isbn: null, sourceUrl: p.canonicalUrl, platform: p.platform, externalId: p.externalId, provider: null, fields: [] }
 }
 
-const linkOnly = (platform: Platform, limitation: string): Adapter => ({
-  platform,
-  canFetch: false,
-  limitation,
-  normalizeMetadata: (p) => ({ status: 'unsupported', metadata: baseMetadata(p), reason: limitation }),
-})
+// —— 作品页适配器（起点、晋江、长佩、豆瓣）——
 
-const DOUBAN_LIMIT = '豆瓣的公开 API 已停止对外提供，条目页也不允许其他网站在浏览器中读取，页间无法合规地自动获取标题、作者和封面。来源链接会保留，请手动补全信息。'
-const CN_LIMIT = '没有面向第三方网页的公开接口，作品页也不允许其他网站在浏览器中读取，页间无法合规地自动获取标题、作者和封面。来源链接会保留，请手动补全信息。'
+type PageRaw = { html: string; finalUrl: string }
 
-/** 只取需要的字段，并校验 Goodreads ID 精确一致。 */
+/** 各平台允许的最终地址（防止被跳转到验证页或其他站点后仍当作作品页解析）。 */
+const PAGE_HOSTS: Record<Exclude<Platform, 'goodreads'>, string[]> = {
+  qidian: ['www.qidian.com', 'book.qidian.com', 'm.qidian.com'],
+  jjwxc: ['www.jjwxc.net', 'jjwxc.net', 'my.jjwxc.net', 'm.jjwxc.net'],
+  gongzicp: ['www.gongzicp.com', 'gongzicp.com', 'm.gongzicp.com'],
+  'douban-book': ['book.douban.com', 'm.douban.com'],
+  'douban-movie': ['movie.douban.com', 'm.douban.com'],
+}
+
+function pageAdapter(platform: Exclude<Platform, 'goodreads'>, label: string, parse: (p: ParsedSource, page: ParsedPage, m: Metadata) => string | null): Adapter {
+  return {
+    platform,
+    requestUrl: (p) => p.canonicalUrl,
+    async fetchMetadata(p, signal) {
+      const res = await readable(p.canonicalUrl, signal, { headers: { Accept: 'text/html' } })
+      const finalUrl = res.url
+      // 开发测试时请求被改写到本地模拟服务，不检查主机
+      if (!(import.meta.env.DEV && env.VITE_IMPORT_MOCK_ORIGIN)) {
+        const host = new URL(finalUrl).hostname
+        if (!PAGE_HOSTS[platform].includes(host)) throw new FetchFailure('forbidden', `请求被跳转到 ${host}（可能是登录或验证页面），页间不会绕过验证`)
+      }
+      return { html: await readHtml(res), finalUrl } satisfies PageRaw
+    },
+    normalizeMetadata(p, raw) {
+      const { html } = raw as PageRaw
+      const metadata = baseMetadata(p)
+      const page = parsePage(html)
+      // 页面中必须出现这个作品编号，避免把首页、验证页或别的作品当成结果
+      if (!html.includes(p.externalId))
+        return { status: 'not-found', metadata, reason: `${label}返回的页面中没有这个作品的编号（可能是验证页、首页或错误页）。` }
+      metadata.provider = `${label}作品页`
+      const problem = parse(p, page, metadata)
+      if (problem) return { status: 'not-found', metadata: baseMetadata(p), reason: problem }
+      if (!metadata.title)
+        return {
+          status: 'not-found',
+          metadata: baseMetadata(p),
+          reason: page.meta.textLength < 200 ? `${label}返回的只是页面框架，作品信息由脚本动态加载，网页无法直接读取。` : `${label}作品页中没有找到可识别的标题信息。`,
+        }
+      return { status: 'ok', metadata, notes: [] }
+    },
+  }
+}
+
+interface ParsedPage {
+  doc: Document
+  meta: HtmlMeta
+  ld: Record<string, unknown>[] // 展开 @graph 后的 JSON-LD 对象
+}
+
+function parsePage(html: string): ParsedPage {
+  const meta = extractHtmlMeta(html)
+  const ld: Record<string, unknown>[] = []
+  const walk = (x: unknown) => {
+    if (Array.isArray(x)) x.forEach(walk)
+    else if (x && typeof x === 'object') {
+      ld.push(x as Record<string, unknown>)
+      if (Array.isArray((x as { '@graph'?: unknown })['@graph'])) walk((x as { '@graph': unknown[] })['@graph'])
+    }
+  }
+  meta.jsonLd.forEach(walk)
+  return { doc: new DOMParser().parseFromString(html, 'text/html'), meta, ld }
+}
+
+const str = (x: unknown) => (typeof x === 'string' && x.trim() ? x.trim() : null)
+const names = (x: unknown): string | null => {
+  const list = (Array.isArray(x) ? x : [x]).map((a) => (typeof a === 'string' ? str(a) : str((a as { name?: unknown })?.name))).filter(Boolean) as string[]
+  return list.length ? [...new Set(list)].join('、') : null
+}
+const ldOfType = (page: ParsedPage, types: string[]) =>
+  page.ld.find((o) => (Array.isArray(o['@type']) ? (o['@type'] as string[]) : [o['@type']]).some((t) => types.includes(String(t))))
+const itemprop = (page: ParsedPage, name: string) => {
+  const el = page.doc.querySelector(`[itemprop="${name}"]`)
+  return el ? str(el.getAttribute('content') ?? el.getAttribute('src') ?? el.textContent) : null
+}
+/** 只接受 http(s) 地址的图片，统一为 https。 */
+const imageUrl = (x: string | null, base: string) => {
+  if (!x) return null
+  try {
+    const u = new URL(x, base)
+    return u.protocol === 'https:' || u.protocol === 'http:' ? u.href.replace(/^http:/, 'https:') : null
+  } catch {
+    return null
+  }
+}
+
+function setField(m: Metadata, key: 'title' | 'author' | 'coverUrl' | 'isbn', value: string | null) {
+  if (!value) return
+  m[key] = value
+  m.fields.push(key)
+}
+
+/** 网络小说站点常用 og:novel:* 标签；其次 JSON-LD、微数据。 */
+function parseNovelPage(p: ParsedSource, page: ParsedPage, m: Metadata): string | null {
+  const og = page.meta.og
+  const book = ldOfType(page, ['Book', 'CreativeWork', 'Article'])
+  setField(m, 'title', str(og['novel:book_name']) ?? str(book?.name) ?? itemprop(page, 'articleSection') ?? itemprop(page, 'name'))
+  setField(m, 'author', str(og['novel:author']) ?? names(book?.author) ?? itemprop(page, 'author'))
+  setField(m, 'coverUrl', imageUrl(str(og.image) ?? str(book?.image) ?? itemprop(page, 'image'), p.canonicalUrl))
+  return null
+}
+
+function parseDoubanBook(p: ParsedSource, page: ParsedPage, m: Metadata): string | null {
+  const book = ldOfType(page, ['Book'])
+  if (!book) return '豆瓣返回的页面中没有图书数据（可能是登录或验证页面）。'
+  const url = str(book.url)
+  if (url && !url.includes(`/subject/${p.externalId}`)) return '豆瓣返回的图书数据与链接中的编号不一致，没有采用。'
+  setField(m, 'title', str(book.name))
+  setField(m, 'author', names(book.author))
+  setField(m, 'isbn', str(book.isbn))
+  setField(m, 'coverUrl', imageUrl(str(page.meta.og.image), p.canonicalUrl))
+  return null
+}
+
+function parseDoubanMovie(p: ParsedSource, page: ParsedPage, m: Metadata): string | null {
+  const movie = ldOfType(page, ['Movie', 'TVSeries'])
+  if (!movie) return '豆瓣返回的页面中没有影视数据（可能是登录或验证页面）。'
+  const url = str(movie.url)
+  if (url && !url.includes(`/subject/${p.externalId}`)) return '豆瓣返回的影视数据与链接中的编号不一致，没有采用。'
+  setField(m, 'title', str(movie.name))
+  m.category = String(movie['@type']) === 'TVSeries' ? 'tv' : 'film'
+  m.fields.push('category')
+  setField(m, 'coverUrl', imageUrl(str(page.meta.og.image) ?? str(movie.image), p.canonicalUrl))
+  return null
+}
+
+// —— Goodreads（经 Open Library）——
+
 type OpenLibraryDoc = { key?: string; title?: string; author_name?: string[]; cover_i?: number; isbn?: string[]; id_goodreads?: string[] }
 type GoodreadsRaw = { docs: OpenLibraryDoc[]; google?: { isbn: string; thumbnail: string | null } | null; googleError?: string }
 
 const goodreadsAdapter: Adapter = {
   platform: 'goodreads',
-  canFetch: true,
+  requestUrl: (p) => `${OPEN_LIBRARY}/search.json?q=id_goodreads:${p.externalId}`,
   async fetchMetadata(p, signal) {
     const q = new URLSearchParams({ q: `id_goodreads:${p.externalId}`, fields: 'key,title,author_name,cover_i,isbn,id_goodreads', limit: '5' })
     const data = (await getJson(`${OPEN_LIBRARY}/search.json?${q}`, signal)) as { docs?: unknown }
@@ -82,14 +200,13 @@ const goodreadsAdapter: Adapter = {
       (d): d is OpenLibraryDoc => !!d && Array.isArray((d as OpenLibraryDoc).id_goodreads) && (d as OpenLibraryDoc).id_goodreads!.includes(p.externalId),
     )
     const raw: GoodreadsRaw = { docs }
-    // Open Library 没有封面：用唯一匹配记录的 ISBN 查 Google Books，ISBN 必须一致
     const doc = docs.length === 1 ? docs[0] : null
     const isbn = doc && !doc.cover_i ? doc.isbn?.find((x) => /^(\d{13}|\d{9}[\dX])$/.test(x)) : undefined
     if (isbn) {
       try {
         raw.google = await googleBooksCover(isbn, signal)
       } catch (err) {
-        raw.googleError = describeError(err)
+        raw.googleError = (err as Error).message
       }
     }
     return raw
@@ -102,20 +219,13 @@ const goodreadsAdapter: Adapter = {
     const d = r.docs[0]
     const notes: string[] = []
     metadata.provider = 'Open Library'
-    const title = typeof d.title === 'string' ? d.title.trim() : ''
-    if (title) (metadata.title = title), metadata.fields.push('title')
-    const authors = (d.author_name ?? []).filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim())
-    if (authors.length) (metadata.author = authors.join('、')), metadata.fields.push('author')
-    if (typeof d.cover_i === 'number' && d.cover_i > 0) {
-      metadata.coverUrl = `${OPEN_LIBRARY_COVERS}/b/id/${d.cover_i}-L.jpg?default=false`
-      metadata.fields.push('coverUrl')
-    } else if (r.google?.thumbnail) {
-      metadata.coverUrl = r.google.thumbnail
-      metadata.fields.push('coverUrl')
+    setField(metadata, 'title', str(d.title))
+    setField(metadata, 'author', names((d.author_name ?? []).filter((x) => typeof x === 'string')))
+    if (typeof d.cover_i === 'number' && d.cover_i > 0) setField(metadata, 'coverUrl', `${OPEN_LIBRARY_COVERS}/b/id/${d.cover_i}-L.jpg?default=false`)
+    else if (r.google?.thumbnail) {
+      setField(metadata, 'coverUrl', r.google.thumbnail)
       notes.push(`封面来自 Google Books（ISBN ${r.google.isbn} 已核对一致）。`)
-    } else {
-      notes.push(r.googleError ? `没有找到封面（Google Books 查询失败：${r.googleError}）。` : '没有找到封面。')
-    }
+    } else notes.push(r.googleError ? `没有找到封面（Google Books 查询失败：${r.googleError}）。` : '没有找到封面。')
     return { status: 'ok', metadata, notes }
   },
 }
@@ -131,15 +241,15 @@ async function googleBooksCover(isbn: string, signal: AbortSignal): Promise<{ is
 }
 
 export const ADAPTERS: Record<Platform, Adapter> = {
-  qidian: linkOnly('qidian', `起点中文网${CN_LIMIT}`),
-  jjwxc: linkOnly('jjwxc', `晋江文学城${CN_LIMIT}`),
-  gongzicp: linkOnly('gongzicp', `长佩文学${CN_LIMIT}`),
-  'douban-book': linkOnly('douban-book', DOUBAN_LIMIT),
-  'douban-movie': linkOnly('douban-movie', DOUBAN_LIMIT),
+  qidian: pageAdapter('qidian', '起点', parseNovelPage),
+  jjwxc: pageAdapter('jjwxc', '晋江', parseNovelPage),
+  gongzicp: pageAdapter('gongzicp', '长佩', parseNovelPage),
+  'douban-book': pageAdapter('douban-book', '豆瓣', parseDoubanBook),
+  'douban-movie': pageAdapter('douban-movie', '豆瓣', parseDoubanMovie),
   goodreads: goodreadsAdapter,
 }
 
-/** recognize：识别链接并找到对应的适配器。 */
+/** recognize：识别链接。 */
 export function recognize(url: string): ParseResult {
   return parseWorkUrl(url)
 }
@@ -147,29 +257,34 @@ export function recognize(url: string): ParseResult {
 /** 获取并规范化元数据。任何失败都返回 status，而不是抛出，保证可以继续手动创建。 */
 export async function fetchMetadata(p: ParsedSource, signal: AbortSignal): Promise<FetchOutcome> {
   const adapter = ADAPTERS[p.platform]
-  if (!adapter.canFetch || !adapter.fetchMetadata) return adapter.normalizeMetadata(p, null) as FetchOutcome
+  let raw: unknown
   try {
-    const raw = await adapter.fetchMetadata(p, signal)
-    return adapter.normalizeMetadata(p, raw) as FetchOutcome
+    raw = await adapter.fetchMetadata(p, signal)
   } catch (err) {
-    return { status: 'failed', metadata: baseMetadata(p), reason: describeError(err) }
+    const f = err instanceof FetchFailure ? err : null
+    return { status: 'failed', metadata: baseMetadata(p), reason: describeError(err), failure: f?.kind ?? 'other' }
+  }
+  try {
+    return adapter.normalizeMetadata(p, raw)
+  } catch (err) {
+    // 请求成功但解析出错：与网络失败区分
+    return { status: 'not-found', metadata: baseMetadata(p), reason: `页面已取得，但解析时出错：${(err as Error).message}` }
   }
 }
 
 export function describeError(err: unknown): string {
   const e = err as Error
+  if (err instanceof FetchFailure) return e.message
   if (e?.name === 'AbortError') return '请求超时或已取消'
   if (e?.name === 'TypeError') return '请求被浏览器拦截或网络不可用（可能是跨域限制或离线）'
   return e?.message || String(err)
 }
 
 async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
-  const res = await timedFetch(url, signal, { headers: { Accept: 'application/json' } })
-  if (!res.ok) throw new Error(`服务返回 ${res.status}`)
-  const len = Number(res.headers.get('content-length') || 0)
-  if (len > MAX_JSON_BYTES) throw new Error('返回数据过大')
+  const res = await readable(url, signal, { headers: { Accept: 'application/json' } })
+  if (Number(res.headers.get('content-length') || 0) > MAX_JSON_BYTES) throw new FetchFailure('too-large', '返回数据过大')
   const text = await res.text()
-  if (text.length > MAX_JSON_BYTES) throw new Error('返回数据过大')
+  if (text.length > MAX_JSON_BYTES) throw new FetchFailure('too-large', '返回数据过大')
   try {
     return JSON.parse(text)
   } catch {
@@ -177,32 +292,32 @@ async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
   }
 }
 
-/** 不带 Cookie、不带来源页地址；超时或外部取消都会中止。 */
-export async function timedFetch(url: string, outer: AbortSignal, init: RequestInit = {}): Promise<Response> {
-  const ctl = new AbortController()
-  const abort = () => ctl.abort()
-  outer.addEventListener('abort', abort)
-  const timer = setTimeout(abort, FETCH_TIMEOUT)
-  try {
-    return await fetch(url, { ...init, mode: 'cors', credentials: 'omit', referrerPolicy: 'no-referrer', signal: ctl.signal })
-  } finally {
-    clearTimeout(timer)
-    outer.removeEventListener('abort', abort)
-  }
+const MAX_COVER_BYTES = 10 * 1024 * 1024
+
+/** 按文件内容（而不是声明的类型）判断图片格式。 */
+export function sniffImage(buf: ArrayBuffer): string | null {
+  const b = new Uint8Array(buf, 0, Math.min(12, buf.byteLength))
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg'
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png'
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return 'image/gif'
+  if (String.fromCharCode(...b.slice(0, 4)) === 'RIFF' && String.fromCharCode(...b.slice(8, 12)) === 'WEBP') return 'image/webp'
+  return null
 }
 
-const MAX_COVER_BYTES = 10 * 1024 * 1024
-const COVER_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
-
-/** 下载封面为文件。只接受图片类型、限制大小；失败时抛出说明（调用方不应让它阻止创建作品）。 */
+/** 下载封面为文件：检查实际图片格式与大小；失败时抛出说明（调用方不应让它阻止创建作品）。 */
 export async function downloadCover(url: string, signal: AbortSignal): Promise<File> {
-  const res = await timedFetch(url, signal)
-  if (!res.ok) throw new Error(`封面服务返回 ${res.status}`)
-  const type = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()
-  if (!COVER_TYPES.includes(type)) throw new Error('封面地址返回的不是图片')
+  const u = new URL(url)
+  if (u.protocol !== 'https:' && !(import.meta.env.DEV && u.hostname === '127.0.0.1')) throw new Error('封面地址不是 https')
+  let res: Response
+  try {
+    res = await readable(url, signal)
+  } catch (err) {
+    throw err instanceof FetchFailure && err.kind === 'cors-blocked' ? new Error('图片服务器不允许其他网站读取这张图片') : err
+  }
   if (Number(res.headers.get('content-length') || 0) > MAX_COVER_BYTES) throw new Error('封面图片过大')
-  const blob = await res.blob()
-  if (blob.size > MAX_COVER_BYTES) throw new Error('封面图片过大')
-  if (blob.size < 100) throw new Error('封面图片无效')
-  return new File([blob], `cover.${type.split('/')[1]}`, { type })
+  const buf = await res.arrayBuffer()
+  if (buf.byteLength > MAX_COVER_BYTES) throw new Error('封面图片过大')
+  const type = sniffImage(buf)
+  if (!type) throw new Error('封面地址返回的不是图片')
+  return new File([buf], `cover.${type.split('/')[1]}`, { type })
 }

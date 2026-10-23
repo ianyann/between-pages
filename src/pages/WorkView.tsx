@@ -50,6 +50,7 @@ export default function WorkView() {
           <p className="mb-2 text-xs tracking-[0.3em] text-mute">{workTypeLabel(work.type)}</p>
           <h1 className="font-serif text-3xl leading-tight break-words">{work.name}</h1>
           {work.author && <p className="mt-2 text-sm">{work.author}</p>}
+          {work.isbn && <p className="mt-1 text-xs text-mute tabular-nums">ISBN {work.isbn}</p>}
           <p className="mt-3 text-sm text-mute">{count} 篇日记</p>
           {work.sources?.map((s) => (
             <a key={`${s.platform}:${s.externalId}`} href={s.url} target="_blank" rel="noopener noreferrer" className="mt-1 block text-xs text-mute underline">

@@ -102,6 +102,7 @@ export async function importBackup(file: File): Promise<BackupSummary> {
       type: validTypes.has(w.type) ? w.type : 'other',
       coverAssetId: w.coverAssetId ?? null,
       ...(typeof w.author === 'string' ? {} : { author: undefined }),
+      ...(typeof w.isbn === 'string' ? {} : { isbn: undefined }),
     }),
   )
   const canvases = (Array.isArray(b.canvases) ? (b.canvases as CanvasDoc[]) : [])

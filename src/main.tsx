@@ -12,6 +12,7 @@ import Library from './pages/Library'
 import WorkView from './pages/WorkView'
 import WorkEditor from './pages/WorkEditor'
 import WorkImport from './pages/WorkImport'
+import ImportCheck from './pages/ImportCheck'
 import Diagnostics from './pages/Diagnostics'
 import Backup from './pages/Backup'
 // 创作桌依赖体积较大的画布库，按需加载，不拖慢其他页面
@@ -126,6 +127,7 @@ createRoot(document.getElementById('root')!).render(
           <Route path="library" element={<Library />} />
           <Route path="library/new" element={<WorkEditor />} />
           <Route path="library/import" element={<WorkImport />} />
+          <Route path="library/import/check" element={<ImportCheck />} />
           <Route path="work/:id" element={<WorkView />} />
           <Route path="work/:id/edit" element={<WorkEditor />} />
           <Route path="diagnostics" element={<Diagnostics />} />
