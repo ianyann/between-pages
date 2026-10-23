@@ -69,6 +69,7 @@ interface Props {
   drawLayerId: string | null // 当前绘画层；橡皮只作用于它
   onStroke: (stroke: Omit<Stroke, 'id'>) => void // 世界坐标的一条完整笔画
   onCutout: (id: string) => void
+  onPro: (id: string) => void // 用专业编辑器（Photopea）编辑这张图片
   onDrawLayer: (id: string) => void
 }
 
@@ -467,7 +468,7 @@ export default function CanvasStage(props: Props) {
         >
           {(
             [
-              ...(selected.type === 'image' ? ([['剪裁', () => props.onCutout(selected.id)]] as const) : []),
+              ...(selected.type === 'image' ? ([['剪裁', () => props.onCutout(selected.id)], ['专业', () => props.onPro(selected.id)]] as const) : []),
               ...(selected.type === 'drawing' ? ([['绘画', () => props.onDrawLayer(selected.id)]] as const) : []),
               ['复制', () => props.onDuplicate(selected.id)],
               ['上移', () => props.onLayer(selected.id, 'up')],

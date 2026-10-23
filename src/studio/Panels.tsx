@@ -321,6 +321,7 @@ interface PropsPanelProps {
   onDelete: () => void
   onEditText: () => void
   onCutout: () => void // 图片：打开剪裁
+  onPro: () => void // 图片：用专业编辑器打开
   onDraw: () => void // 绘画层：继续绘画
   isCutout: boolean // 图片是否为剪裁结果
 }
@@ -445,11 +446,14 @@ function DrawingProps({ el, onPreview, onCommit, onDraw }: PropsPanelProps & { e
   )
 }
 
-function ImageProps({ el, naturalRatio, onPreview, onCommit, onCutout, isCutout }: PropsPanelProps & { el: ImageElement }) {
+function ImageProps({ el, naturalRatio, onPreview, onCommit, onCutout, onPro, isCutout }: PropsPanelProps & { el: ImageElement }) {
   return (
     <>
       <button onClick={onCutout} className="w-full border border-ink py-2 text-sm">
         {isCutout ? '继续编辑剪裁' : '剪裁（自由轮廓 / 擦除）'}
+      </button>
+      <button onClick={onPro} className="-mt-4 w-full border border-line py-2 text-sm">
+        专业编辑（第三方 Photopea）
       </button>
       <Slider
         label="不透明度"

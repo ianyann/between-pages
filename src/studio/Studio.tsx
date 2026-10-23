@@ -1,6 +1,6 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   addToBox,
   CANVAS_HEIGHT,
@@ -32,7 +32,11 @@ import {
   createImage,
   createText,
   duplicateElement,
+  fitIntoFrame,
+  insertAbove,
   moveLayer,
+  sameRatio,
+  type FitMode,
   patchElement,
   removeElement,
   type LayerMove,
@@ -72,6 +76,12 @@ export default function Studio() {
   // —— 剪裁 ——
   const [cutoutFor, setCutoutFor] = useState<string | null>(null) // 正在剪裁的图片元素 ID
   const [cutoutTarget, setCutoutTarget] = useState<{ elId: string; sourceAssetId: string; cutoutId: string | null } | null>(null)
+
+  // —— 专业编辑（Photopea）返回 ——
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const proHandled = useRef('')
+  const [fitChoice, setFitChoice] = useState<{ elId: string; assetId: string; img: HTMLImageElement } | null>(null)
 
   // —— 撤销 / 重做：保存整份快照；预览中的变化（拖滑块等）结束时才记一步 ——
   const presentRef = useRef(present)
@@ -363,6 +373,50 @@ export default function Studio() {
     }
   }
 
+  /** 用专业编辑器打开画布上的图片：先把画布存好，再带上元素 ID 离开。 */
+  async function openPro(elId: string) {
+    const el = presentRef.current.elements.find((e) => e.id === elId)
+    if (el?.type !== 'image') return
+    if (!(await save())) return setHint('画布还没保存成功，请稍后再试。')
+    navigate(`/pro/${el.assetId}?from=${encodeURIComponent(`/entry/${id}/studio`)}&el=${el.id}`)
+  }
+
+  // 从专业编辑器返回：?pro=结果素材&action=replace|add&el=原元素。只处理一次，随即清掉参数（刷新不会重复执行）
+  useEffect(() => {
+    if (!loaded) return
+    const proId = searchParams.get('pro')
+    const action = searchParams.get('action')
+    const elId = searchParams.get('el')
+    const key = searchParams.toString()
+    if (!proId || !elId || proHandled.current === key) return
+    proHandled.current = key
+    setSearchParams({}, { replace: true })
+    ;(async () => {
+      const img = await ensureImage(proId)
+      if (!img) return setHint('编辑结果无法读取；它仍保存在素材盒的「专业编辑」中。')
+      const el = presentRef.current.elements.find((e): e is ImageElement => e.id === elId && e.type === 'image')
+      if (!el) return setHint('原来的图片已不在画布上；编辑结果已保存在素材盒的「专业编辑」中。')
+      const [nw, nh] = [img.naturalWidth, img.naturalHeight]
+      if (action === 'add') {
+        // 新图层放在原图正上方，中心与角度相同，完整放进原图的框内
+        const added: ImageElement = { ...el, id: newId(), assetId: proId, ...fitIntoFrame(el, nw, nh, 'contain') }
+        update((d) => ({ ...d, elements: insertAbove(d.elements, el.id, added) }))
+        setSelectedId(added.id)
+      } else if (action === 'replace') {
+        if (sameRatio(el, nw, nh)) replaceImage(el.id, proId, 'width', img)
+        else setFitChoice({ elId: el.id, assetId: proId, img }) // 比例不同：先预览，由用户决定
+      }
+    })()
+  }, [loaded, searchParams, setSearchParams, ensureImage, update])
+
+  /** 原位替换：保留元素 ID、角度、图层顺序与样式，只换素材并按比例调整尺寸（中心不动）。记为一步撤销。 */
+  function replaceImage(elId: string, assetId: string, mode: FitMode, img: HTMLImageElement) {
+    const el = presentRef.current.elements.find((e): e is ImageElement => e.id === elId && e.type === 'image')
+    if (!el) return setHint('原来的图片已不在画布上；编辑结果已保存在素材盒的「专业编辑」中。')
+    patch(elId, { assetId, ...fitIntoFrame(el, img.naturalWidth, img.naturalHeight, mode) } as Partial<ImageElement>)
+    setSelectedId(elId)
+  }
+
   function duplicate(elId: string) {
     const el = presentRef.current.elements.find((e) => e.id === elId)
     if (el) add(duplicateElement(el))
@@ -558,6 +612,7 @@ export default function Studio() {
         if (!wide) setDrawer(null)
       }}
       onCutout={() => setCutoutFor(selected.id)}
+      onPro={() => openPro(selected.id)}
       onDraw={() => enterDraw(selected.id)}
       isCutout={selected.type === 'image' && cutoutIds.has(selected.assetId)}
     />
@@ -588,6 +643,7 @@ export default function Studio() {
           drawLayerId={drawLayerId}
           onStroke={addStroke}
           onCutout={(elId) => setCutoutFor(elId)}
+          onPro={openPro}
           onDrawLayer={(elId) => enterDraw(elId)}
           images={images}
           selectedId={selectedId}
@@ -665,6 +721,25 @@ export default function Studio() {
     </p>
   )
 
+  const fitDialog = fitChoice && (() => {
+    const el = present.elements.find((e): e is ImageElement => e.id === fitChoice.elId && e.type === 'image')
+    if (!el) return null
+    return (
+      <FitPreview
+        el={el}
+        img={fitChoice.img}
+        onApply={(mode) => {
+          setFitChoice(null)
+          replaceImage(el.id, fitChoice.assetId, mode, fitChoice.img)
+        }}
+        onCancel={() => {
+          setFitChoice(null)
+          setHint('没有替换画布上的图片；编辑结果已保存在素材盒的「专业编辑」中。')
+        }}
+      />
+    )
+  })()
+
   const cutoutEditor = cutoutTarget && (
     <CutoutEditor
       key={cutoutTarget.elId}
@@ -679,6 +754,7 @@ export default function Studio() {
     return (
       <div className="flex h-dvh flex-col bg-paper">
         {cutoutEditor}
+        {fitDialog}
         {topBar}
         {hintLine}
         <div className="flex min-h-0 flex-1">
@@ -723,6 +799,7 @@ export default function Studio() {
   return (
     <div className="flex h-dvh flex-col bg-paper">
       {cutoutEditor}
+      {fitDialog}
       {topBar}
       {hintLine}
       {stage}
@@ -747,6 +824,51 @@ export default function Studio() {
           <ToolButton on={drawer === 'background'} onClick={() => setDrawer(drawer === 'background' ? null : 'background')}>背景</ToolButton>
         )}
       </nav>
+    </div>
+  )
+}
+
+const FIT_OPTIONS: { mode: FitMode; label: string; note: string }[] = [
+  { mode: 'contain', label: '完整放进原框', note: '不裁切、不变形，可能留空' },
+  { mode: 'width', label: '与原图同宽', note: '高度按新比例变化' },
+  { mode: 'height', label: '与原图同高', note: '宽度按新比例变化' },
+]
+
+/** 新旧图片比例不同时的适配预览：虚线为原图位置，从不拉伸新图。 */
+function FitPreview({ el, img, onApply, onCancel }: { el: ImageElement; img: HTMLImageElement; onApply: (m: FitMode) => void; onCancel: () => void }) {
+  const [mode, setMode] = useState<FitMode>('contain')
+  const nw = img.naturalWidth
+  const nh = img.naturalHeight
+  const flat = { ...el, x: 0, y: 0, rotation: 0 } // 预览不旋转，便于比较
+  const box = fitIntoFrame(flat, nw, nh, mode)
+  const x0 = Math.min(0, box.x)
+  const y0 = Math.min(0, box.y)
+  const w = Math.max(el.width, box.x + box.width) - x0
+  const h = Math.max(el.height, box.y + box.height) - y0
+  const k = 240 / Math.max(w, h)
+  return (
+    <div role="dialog" aria-label="适配预览" className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4">
+      <div className="w-full max-w-md bg-paper p-5 text-sm">
+        <h2 className="mb-1 font-serif text-lg">新图片的比例不同</h2>
+        <p className="mb-4 text-mute">原图 {Math.round(el.width)}×{Math.round(el.height)}，新图 {nw}×{nh}。选择放法；位置中心、角度、图层与透明度保持不变。</p>
+        <div className="checker relative mx-auto mb-4" style={{ width: w * k, height: h * k }}>
+          <img src={img.src} alt="" className="absolute max-w-none" style={{ left: (box.x - x0) * k, top: (box.y - y0) * k, width: box.width * k, height: box.height * k }} />
+          <div className="absolute border border-dashed border-ink" style={{ left: -x0 * k, top: -y0 * k, width: el.width * k, height: el.height * k }} />
+        </div>
+        <div className="mb-5 space-y-1.5">
+          {FIT_OPTIONS.map((o) => (
+            <label key={o.mode} className="flex items-baseline gap-2">
+              <input type="radio" name="fit" checked={mode === o.mode} onChange={() => setMode(o.mode)} className="accent-ink" />
+              <span>{o.label}</span>
+              <span className="text-xs text-mute">{o.note}</span>
+            </label>
+          ))}
+        </div>
+        <div className="flex justify-end gap-3">
+          <button onClick={onCancel} className="rounded-full border border-line px-5 py-1.5">取消</button>
+          <button onClick={() => onApply(mode)} className="rounded-full bg-ink px-5 py-1.5 text-paper">替换</button>
+        </div>
+      </div>
     </div>
   )
 }

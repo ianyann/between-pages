@@ -12,8 +12,9 @@ import Dexie, { type EntityTable, type Transaction } from 'dexie'
  * v3.5 新增 boxItems（素材盒）；画布元素允许位于纸张外的桌面区域（坐标系不变）
  * v5 新增 cutouts（剪裁素材的遮罩与来源）；画布新增 drawing（绘画层）元素类型
  * v6 新增 proEdits（专业编辑器实验：结果 PNG、来源与可选 PSD 的关联）
+ * v7 proEdits 增加 editVersion、rootAssetId（版本链），升级时为已有记录补全
  */
-export const DB_VERSION = 6
+export const DB_VERSION = 7
 
 export type EntryStatus = 'draft' | 'done'
 
@@ -259,6 +260,23 @@ db.version(6).stores({
   proEdits: 'id, sourceAssetId, psdAssetId, updatedAt',
 })
 
+// v7 只为专业编辑记录补全版本字段，不改动其他数据
+db.version(7)
+  .stores({
+    entries: 'id, entryDate, updatedAt, status, *workIds, *imageIds',
+    assets: 'id, entryId',
+    works: 'id, type, name, updatedAt, coverAssetId',
+    canvases: 'id, entryId, updatedAt, *assetIds',
+    boxItems: 'id, category, addedAt',
+    cutouts: 'id, sourceAssetId, updatedAt',
+    proEdits: 'id, sourceAssetId, psdAssetId, rootAssetId, updatedAt',
+  })
+  .upgrade(async (tx: Transaction) => {
+    const all: ProEdit[] = await tx.table('proEdits').toArray()
+    const byId = new Map(all.map((p) => [p.id, p]))
+    for (const p of all) await tx.table('proEdits').put(fillProEditDefaults(p, (id) => byId.get(id)))
+  })
+
 /** 为旧版本日记补全缺失字段（数据库迁移与导入备份共用）。只补缺失项，不改 ID、不动其他内容。 */
 export function fillEntryDefaults(e: Partial<Entry>) {
   if (!Array.isArray(e.workIds)) e.workIds = []
@@ -344,17 +362,41 @@ export async function addToBox(asset: Asset, item: BoxItem) {
 }
 
 /**
- * 专业编辑器（Photopea 实验）的保存记录：
+ * 专业编辑器（Photopea）的一次保存 = 一个新版本：
  * id 为保存到素材盒的透明 PNG 结果；psdAssetId 指向同时保存的 PSD（保留图层与蒙版，不作为图片显示）。
- * 来源图与 PSD 都不会因为删除结果而连带删除来源图。
+ * 版本链：rootAssetId（最初的原图）→ v1 → v2 …；每个版本记录它的上一版 sourceAssetId。
+ * 删除结果不会连带删除来源图或原图。
  */
 export interface ProEdit {
-  id: string // = 结果 PNG 的素材 ID
-  sourceAssetId: string // 打开编辑器时的素材（原图或上一次的结果），从不被覆盖
-  psdAssetId: string | null
-  editor: 'photopea'
+  id: string // = 结果 PNG 的素材 ID（parentAssetId 即 sourceAssetId）
+  sourceAssetId: string // 打开编辑器时的素材（原图或上一版结果），从不被覆盖
+  psdAssetId: string | null // 本版本的 PSD（sourcePsdId）；PSD 导出失败、用户选择只存 PNG 时为 null
+  rootAssetId: string // 版本链最初的原图（v7 起）
+  editVersion: number // 从 1 开始（v7 起）
+  editor: 'photopea' // editorType
   createdAt: number
   updatedAt: number
+}
+
+/** 为旧记录或旧备份补全版本字段。lookup 用于沿版本链向上查找。 */
+export function fillProEditDefaults(p: Partial<ProEdit> & { id: string; sourceAssetId: string }, lookup: (id: string) => Partial<ProEdit> | undefined): ProEdit {
+  let version = 1
+  let root = p.sourceAssetId
+  const seen = new Set([p.id])
+  for (let parent = lookup(p.sourceAssetId); parent && !seen.has(parent.id!); parent = lookup(parent.sourceAssetId!)) {
+    seen.add(parent.id!)
+    version++
+    root = parent.sourceAssetId!
+  }
+  return {
+    ...p,
+    psdAssetId: typeof p.psdAssetId === 'string' ? p.psdAssetId : null,
+    rootAssetId: p.rootAssetId ?? root,
+    editVersion: p.editVersion ?? version,
+    editor: 'photopea',
+    createdAt: p.createdAt ?? Date.now(),
+    updatedAt: p.updatedAt ?? p.createdAt ?? Date.now(),
+  }
 }
 
 export const PSD_MIME = 'image/vnd.adobe.photoshop'
@@ -362,11 +404,19 @@ export const PSD_MIME = 'image/vnd.adobe.photoshop'
 /** 保存专业编辑结果：PNG、可选 PSD、关联记录、素材盒条目在同一事务中写入。 */
 export async function saveProEdit(png: Asset, psd: Asset | null, record: ProEdit, item: BoxItem) {
   await db.transaction('rw', [db.assets, db.proEdits, db.boxItems], async () => {
-    await db.assets.put(png)
-    if (psd) await db.assets.put(psd)
-    await db.proEdits.put(record)
-    await db.boxItems.put(item)
+    // 来源必须仍然存在；新结果一律用 add，ID 冲突时整个事务回滚，绝不覆盖已有素材
+    if (!(await db.assets.get(record.sourceAssetId))) throw new Error('原素材已不存在，没有保存。')
+    await db.assets.add(png)
+    if (psd) await db.assets.add(psd)
+    await db.proEdits.add(record)
+    await db.boxItems.add(item)
   })
+}
+
+/** 以 sourceAssetId 为上一版时，新版本的版本号与原图。 */
+export async function nextProEditVersion(sourceAssetId: string): Promise<{ editVersion: number; rootAssetId: string }> {
+  const parent = await db.proEdits.get(sourceAssetId)
+  return parent ? { editVersion: parent.editVersion + 1, rootAssetId: parent.rootAssetId } : { editVersion: 1, rootAssetId: sourceAssetId }
 }
 
 export type Box = { x: number; y: number; width: number; height: number }

@@ -163,3 +163,32 @@ export function scaleRotateAroundCenter(el: CanvasElement, k: number, rotation: 
   if (el.type === 'text') (patch as Partial<TextElement>).style = { ...el.style, fontSize: Math.max(6, Math.round(el.style.fontSize * k)) }
   return patch
 }
+
+export type FitMode = 'contain' | 'width' | 'height'
+
+/**
+ * 新图片（原始尺寸 nw×nh）放进旧元素的位置：保持中心与角度不变，按原始比例缩放，从不拉伸。
+ * contain：完整放进旧框；width / height：与旧框同宽 / 同高。
+ */
+export function fitIntoFrame(el: Pick<ImageElement, 'x' | 'y' | 'width' | 'height' | 'rotation'>, nw: number, nh: number, mode: FitMode) {
+  const r = nh / nw
+  const k = Math.min(el.width / nw, el.height / nh)
+  const [width, height] = mode === 'width' ? [el.width, el.width * r] : mode === 'height' ? [el.height / r, el.height] : [nw * k, nh * k]
+  const rad = (el.rotation * Math.PI) / 180
+  const [cos, sin] = [Math.cos(rad), Math.sin(rad)]
+  const cx = el.x + (el.width / 2) * cos - (el.height / 2) * sin
+  const cy = el.y + (el.width / 2) * sin + (el.height / 2) * cos
+  return { x: cx - (width / 2) * cos + (height / 2) * sin, y: cy - (width / 2) * sin - (height / 2) * cos, width, height }
+}
+
+/** 新旧比例差异不超过 1% 时视为相同，可直接替换。 */
+export const sameRatio = (el: Pick<ImageElement, 'width' | 'height'>, nw: number, nh: number) => Math.abs(nh / nw / (el.height / el.width) - 1) <= 0.01
+
+/** 把 el 放在 refId 所在图层的正上方。 */
+export function insertAbove(els: CanvasElement[], refId: string, el: CanvasElement): CanvasElement[] {
+  const i = els.findIndex((e) => e.id === refId)
+  if (i < 0) return addElement(els, el)
+  const list = [...els]
+  list.splice(i + 1, 0, el)
+  return renumber(list)
+}

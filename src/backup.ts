@@ -1,4 +1,4 @@
-import { BOX_CATEGORIES, db, DB_VERSION, fillEntryDefaults, normalizeCanvas, WORK_TYPES, type Asset, type BoxItem, type CanvasDoc, type Cutout, type ProEdit, type Entry, type Work } from './db'
+import { BOX_CATEGORIES, db, DB_VERSION, fillEntryDefaults, fillProEditDefaults, normalizeCanvas, WORK_TYPES, type Asset, type BoxItem, type CanvasDoc, type Cutout, type ProEdit, type Entry, type Work } from './db'
 
 /**
  * 备份文件格式（JSON）：
@@ -107,9 +107,9 @@ export async function importBackup(file: File): Promise<BackupSummary> {
   const cutouts: Cutout[] = (Array.isArray(b.cutouts) ? (b.cutouts as BackupCutout[]) : [])
     .filter((c) => typeof c?.id === 'string' && typeof c.sourceAssetId === 'string' && typeof c.mask === 'string')
     .map((c) => ({ ...c, path: Array.isArray(c.path) ? c.path : [], mask: fromBase64(c.mask) }))
-  const proEdits: ProEdit[] = (Array.isArray(b.proEdits) ? (b.proEdits as ProEdit[]) : []).filter(
-    (p) => typeof p?.id === 'string' && typeof p.sourceAssetId === 'string',
-  ).map((p) => ({ ...p, psdAssetId: typeof p.psdAssetId === 'string' ? p.psdAssetId : null, editor: 'photopea' as const }))
+  const rawPro = (Array.isArray(b.proEdits) ? (b.proEdits as ProEdit[]) : []).filter((p) => typeof p?.id === 'string' && typeof p.sourceAssetId === 'string')
+  const rawById = new Map(rawPro.map((p) => [p.id, p]))
+  const proEdits: ProEdit[] = rawPro.map((p) => fillProEditDefaults(p, (id) => rawById.get(id))) // v6 备份没有版本字段
   const assets: Asset[] = (b.assets as BackupAsset[])
     .filter((a) => typeof a?.id === 'string' && typeof a.data === 'string')
     .map((a) => ({ ...a, data: fromBase64(a.data) }))
