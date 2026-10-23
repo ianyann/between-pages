@@ -1,9 +1,9 @@
-import { BOX_CATEGORIES, db, DB_VERSION, fillEntryDefaults, fillProEditDefaults, normalizeCanvas, WORK_TYPES, type Asset, type BoxItem, type CanvasDoc, type Cutout, type ProEdit, type Entry, type Work } from './db'
+import { BOX_CATEGORIES, db, DB_VERSION, fillEntryDefaults, fillProEditDefaults, normalizeCanvas, normalizeWorkSources, WORK_TYPES, type Asset, type BoxItem, type CanvasDoc, type Cutout, type ProEdit, type Entry, type Work } from './db'
 
 /**
  * 备份文件格式（JSON）：
  * { app, format, dbVersion, exportedAt, entries, works, canvases, boxItems, assets }
- * works（v2 起）、canvases（v3 起）、boxItems（v4 起）、cutouts（v5 起）、proEdits（v6 起）为可选，旧备份没有这些项也能导入。
+ * works（v2 起；v8 起可含 author / sources）、canvases（v3 起）、boxItems（v4 起）、cutouts（v5 起）、proEdits（v6 起）为可选，旧备份没有这些项也能导入。
  * 专业编辑保存的 PSD 作为普通素材存在 assets 中（mimeType 为 PSD），随 assets 一起备份。
  * assets[].data、boxItems[].thumb、cutouts[].mask 为 base64 编码的二进制。
  * format 只在文件结构本身变化时递增；dbVersion 记录导出时的数据库版本，导入时据此补全旧字段。
@@ -96,7 +96,14 @@ export async function importBackup(file: File): Promise<BackupSummary> {
   const validTypes = new Set(WORK_TYPES.map((t) => t.value))
   const works = (Array.isArray(b.works) ? (b.works as Work[]) : []).filter(
     (w) => typeof w?.id === 'string' && typeof w.name === 'string',
-  ).map((w) => ({ ...w, type: validTypes.has(w.type) ? w.type : 'other', coverAssetId: w.coverAssetId ?? null }))
+  ).map((w) =>
+    normalizeWorkSources({
+      ...w,
+      type: validTypes.has(w.type) ? w.type : 'other',
+      coverAssetId: w.coverAssetId ?? null,
+      ...(typeof w.author === 'string' ? {} : { author: undefined }),
+    }),
+  )
   const canvases = (Array.isArray(b.canvases) ? (b.canvases as CanvasDoc[]) : [])
     .filter((c) => typeof c?.id === 'string' && typeof c.entryId === 'string')
     .map(normalizeCanvas)

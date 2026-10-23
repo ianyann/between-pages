@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { db, saveWork, WORK_TYPES, type Asset, type Work, type WorkType } from '../db'
+import { db, saveWork, WORK_TYPES, type Asset, type Work, type WorkSource, type WorkType } from '../db'
+import { PLATFORM_LABELS, type Platform } from '../import/parse'
 import { assetToUrl, fileToAsset, newId } from '../lib'
 
 /** 新增 / 编辑作品。作品字段少，采用手动保存。 */
@@ -12,6 +13,8 @@ export default function WorkEditor() {
   const [loaded, setLoaded] = useState(!params.id)
   const [existing, setExisting] = useState<Work | null>(null)
   const [name, setName] = useState('')
+  const [author, setAuthor] = useState('')
+  const [sources, setSources] = useState<WorkSource[]>([])
   const [type, setType] = useState<WorkType>('manga')
   const [coverId, setCoverId] = useState<string | null>(null)
   const [coverUrl, setCoverUrl] = useState<string | null>(null)
@@ -38,6 +41,8 @@ export default function WorkEditor() {
         if (cancelled) return
         setExisting(work)
         setName(work.name)
+        setAuthor(work.author ?? '')
+        setSources(work.sources ?? [])
         setType(work.type)
         setCoverId(work.coverAssetId)
         showCover(asset ? assetToUrl(asset) : null)
@@ -77,7 +82,17 @@ export default function WorkEditor() {
     const now = Date.now()
     try {
       await saveWork(
-        { id, name: name.trim(), type, coverAssetId: coverId, createdAt: existing?.createdAt ?? now, updatedAt: now },
+        {
+          ...existing, // 保留其他字段
+          id,
+          name: name.trim(),
+          type,
+          coverAssetId: coverId,
+          author: author.trim() || undefined,
+          sources,
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+        },
         newCover && newCover.id === coverId ? newCover : null,
       )
       navigate(`/work/${id}`, { replace: true })
@@ -150,6 +165,16 @@ export default function WorkEditor() {
               className="w-full border-b border-line bg-transparent pb-2 font-serif text-2xl outline-none placeholder:text-line focus:border-ink"
             />
           </label>
+          <label className="block">
+            <span className="mb-2 block text-xs tracking-[0.2em] text-mute">作者</span>
+            <input
+              id="work-author"
+              value={author}
+              onChange={(e) => setAuthor(e.target.value)}
+              placeholder="可选"
+              className="w-full border-b border-line bg-transparent pb-2 outline-none placeholder:text-line focus:border-ink"
+            />
+          </label>
           <div>
             <span className="mb-3 block text-xs tracking-[0.2em] text-mute">类型</span>
             <div className="flex flex-wrap gap-2">
@@ -164,6 +189,20 @@ export default function WorkEditor() {
               ))}
             </div>
           </div>
+          {sources.length > 0 && (
+            <div>
+              <span className="mb-2 block text-xs tracking-[0.2em] text-mute">来源</span>
+              <ul className="space-y-1.5 text-sm">
+                {sources.map((s) => (
+                  <li key={`${s.platform}:${s.externalId}`} className="flex items-baseline gap-3">
+                    <span className="shrink-0 text-mute">{PLATFORM_LABELS[s.platform as Platform] ?? s.platform}</span>
+                    <span className="min-w-0 flex-1 truncate">{s.url}</span>
+                    <button onClick={() => setSources((l) => l.filter((x) => x !== s))} className="shrink-0 text-xs text-mute">移除</button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {hint && <p className="text-sm text-red-700">{hint}</p>}
         </div>
       </div>

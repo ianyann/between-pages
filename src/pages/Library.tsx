@@ -11,7 +11,7 @@ export default function Library() {
   const [query, setQuery] = useState('')
 
   const q = query.trim().toLowerCase()
-  const shown = works?.filter((w) => (type === 'all' || w.type === type) && w.name.toLowerCase().includes(q))
+  const shown = works?.filter((w) => (type === 'all' || w.type === type) && (w.name.toLowerCase().includes(q) || (w.author ?? '').toLowerCase().includes(q)))
 
   return (
     <div className="pb-16">
@@ -27,9 +27,12 @@ export default function Library() {
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索作品名称"
+            placeholder="搜索作品名称或作者"
             className="min-w-0 flex-1 border-b border-line bg-transparent py-1.5 outline-none placeholder:text-mute/60 focus:border-ink"
           />
+          <Link to="/library/import" className="shrink-0 rounded-full border border-ink px-4 py-1.5 text-sm">
+            从链接导入
+          </Link>
           <Link to="/library/new" className="shrink-0 rounded-full bg-ink px-4 py-1.5 text-sm text-paper">
             新增作品
           </Link>

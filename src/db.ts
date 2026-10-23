@@ -14,7 +14,7 @@ import Dexie, { type EntityTable, type Transaction } from 'dexie'
  * v6 新增 proEdits（专业编辑器实验：结果 PNG、来源与可选 PSD 的关联）
  * v7 proEdits 增加 editVersion、rootAssetId（版本链），升级时为已有记录补全
  */
-export const DB_VERSION = 7
+export const DB_VERSION = 8
 
 export type EntryStatus = 'draft' | 'done'
 
@@ -148,11 +148,12 @@ export interface Cutout {
   updatedAt: number
 }
 
-export type WorkType = 'manga' | 'novel' | 'film' | 'tv' | 'other'
+export type WorkType = 'manga' | 'novel' | 'book' | 'film' | 'tv' | 'other'
 
 export const WORK_TYPES: { value: WorkType; label: string }[] = [
   { value: 'manga', label: '漫画' },
   { value: 'novel', label: '小说' },
+  { value: 'book', label: '图书' },
   { value: 'film', label: '电影' },
   { value: 'tv', label: '电视剧' },
   { value: 'other', label: '其他' },
@@ -167,7 +168,36 @@ export interface Work {
   coverAssetId: string | null // 封面，指向 assets 表
   createdAt: number
   updatedAt: number
+  author?: string // v8 起，可选
+  sources?: WorkSource[] // v8 起：从链接导入或关联的来源；旧作品没有此字段
+  sourceKeys?: string[] // 由 sources 计算的「platform:externalId」，用于查重（多值索引）
 }
+
+/** 作品的一个来源（第三方平台上的条目）。只记录确实获得的信息。 */
+export interface WorkSource {
+  platform: string // 见 import/parse.ts 的 Platform
+  externalId: string
+  url: string // 规范化后的来源链接
+  addedAt: number
+  /** 自动获取到的字段及其提供方；没有自动获取时省略。 */
+  fetched?: { provider: string; fields: string[]; fetchedAt: number }
+  coverUrl?: string // 封面的原始地址（封面本身已存入素材库，不依赖此地址）
+}
+
+/** 规范化来源列表并重新计算查重键（保存、导入备份时共用）。 */
+export function normalizeWorkSources(w: Work): Work {
+  const sources = (Array.isArray(w.sources) ? w.sources : []).filter(
+    (x) => x && typeof x.platform === 'string' && typeof x.externalId === 'string' && typeof x.url === 'string',
+  )
+  if (!sources.length) {
+    const { sources: _s, sourceKeys: _k, ...rest } = w
+    return rest
+  }
+  return { ...w, sources, sourceKeys: [...new Set(sources.map((x) => `${x.platform}:${x.externalId}`))] }
+}
+
+/** 已有使用同一来源（platform + externalId）的作品。 */
+export const findWorkBySource = (key: string) => db.works.where('sourceKeys').equals(key).first()
 
 /**
  * 图片素材：以二进制形式存入 IndexedDB，可在任何时候恢复。
@@ -276,6 +306,17 @@ db.version(7)
     const byId = new Map(all.map((p) => [p.id, p]))
     for (const p of all) await tx.table('proEdits').put(fillProEditDefaults(p, (id) => byId.get(id)))
   })
+
+// v8 作品增加作者与来源（可选字段），只新增查重索引，不改动已有数据
+db.version(8).stores({
+  entries: 'id, entryDate, updatedAt, status, *workIds, *imageIds',
+  assets: 'id, entryId',
+  works: 'id, type, name, updatedAt, coverAssetId, *sourceKeys',
+  canvases: 'id, entryId, updatedAt, *assetIds',
+  boxItems: 'id, category, addedAt',
+  cutouts: 'id, sourceAssetId, updatedAt',
+  proEdits: 'id, sourceAssetId, psdAssetId, rootAssetId, updatedAt',
+})
 
 /** 为旧版本日记补全缺失字段（数据库迁移与导入备份共用）。只补缺失项，不改 ID、不动其他内容。 */
 export function fillEntryDefaults(e: Partial<Entry>) {
@@ -513,10 +554,40 @@ export async function saveWork(work: Work, newCover: Asset | null) {
   await db.transaction('rw', ASSET_TABLES(), async () => {
     const prev = await db.works.get(work.id)
     if (newCover) await db.assets.put(newCover)
-    await db.works.put(work)
+    await db.works.put(normalizeWorkSources(work))
     if (prev?.coverAssetId && prev.coverAssetId !== work.coverAssetId) {
       await deleteUnreferencedAssets([prev.coverAssetId])
     }
+  })
+}
+
+export class DuplicateSourceError extends Error {
+  constructor(public work: Work) {
+    super(`这个来源已关联到作品《${work.name}》。`)
+  }
+}
+
+/** 导入为新作品：在同一事务里再次查重，避免并发重复导入。 */
+export async function importWork(work: Work, cover: Asset | null) {
+  await db.transaction('rw', ASSET_TABLES(), async () => {
+    for (const key of normalizeWorkSources(work).sourceKeys ?? []) {
+      const dup = await db.works.where('sourceKeys').equals(key).first()
+      if (dup) throw new DuplicateSourceError(dup)
+    }
+    if (cover) await db.assets.add(cover)
+    await db.works.add(normalizeWorkSources(work))
+  })
+}
+
+/** 把来源关联到已有作品：只追加来源，不改动标题、作者、类型与封面。 */
+export async function linkSourceToWork(workId: string, source: WorkSource) {
+  await db.transaction('rw', db.works, async () => {
+    const key = `${source.platform}:${source.externalId}`
+    const dup = await db.works.where('sourceKeys').equals(key).first()
+    if (dup) throw new DuplicateSourceError(dup)
+    const work = await db.works.get(workId)
+    if (!work) throw new Error('这部作品已不存在。')
+    await db.works.put(normalizeWorkSources({ ...work, sources: [...(work.sources ?? []), source], updatedAt: Date.now() }))
   })
 }
 

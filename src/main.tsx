@@ -11,6 +11,7 @@ import EntryEditor from './pages/EntryEditor'
 import Library from './pages/Library'
 import WorkView from './pages/WorkView'
 import WorkEditor from './pages/WorkEditor'
+import WorkImport from './pages/WorkImport'
 import Diagnostics from './pages/Diagnostics'
 import Backup from './pages/Backup'
 // 创作桌依赖体积较大的画布库，按需加载，不拖慢其他页面
@@ -34,7 +35,7 @@ function Layout() {
     )
   return (
     <div className="mx-auto min-h-dvh max-w-2xl px-5 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
-      {pathname !== '/' && !pathname.endsWith('/edit') && pathname !== '/library/new' && (
+      {pathname !== '/' && !pathname.endsWith('/edit') && pathname !== '/library/new' && pathname !== '/library/import' && (
         <nav className="flex items-baseline justify-between py-5">
           <Link to="/" className="font-serif text-base tracking-[0.2em]">页间</Link>
           <div className="flex gap-5 text-sm text-mute">
@@ -124,6 +125,7 @@ createRoot(document.getElementById('root')!).render(
           />
           <Route path="library" element={<Library />} />
           <Route path="library/new" element={<WorkEditor />} />
+          <Route path="library/import" element={<WorkImport />} />
           <Route path="work/:id" element={<WorkView />} />
           <Route path="work/:id/edit" element={<WorkEditor />} />
           <Route path="diagnostics" element={<Diagnostics />} />
